@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: murmur-ingest-worker
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: murmur-ingest
+  template:
+    metadata:
+      labels:
+        app: murmur-ingest
+    spec:
+      containers:
+      - name: ingest-processor
+        image: murmur-ingest:latest
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: KAFKA_BROKER
+          value: "murmur-kafka-broker:9092"
+        resources:
+          limits:
+            nvidia.com/gpu: 1 # Request exclusive GPU access for CUDA STFT
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+      nodeSelector:
+        nvidia.com/gpu.present: "true"

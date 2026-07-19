@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: murmur-inference-server
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: murmur-inference
+  template:
+    metadata:
+      labels:
+        app: murmur-inference
+    spec:
+      containers:
+      - name: inference-api
+        image: murmur-inference:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        resources:
+          limits:
+            nvidia.com/gpu: 1 # Required to load the LLM into VRAM
+          requests:
+            cpu: "4"
+            memory: "16Gi"
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: murmur-inference-service
+  namespace: default
+spec:
+  type: LoadBalancer
+  selector:
+    app: murmur-inference
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
