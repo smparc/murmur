@@ -1,0 +1,22 @@
+# Streaming & Orchestration
+confluent-kafka==2.3.0
+dagster==1.6.0
+dagster-webserver==1.6.0
+
+# GPU Compute & Data Processing
+cupy-cuda12x==13.0.0
+cudf-cu12==24.2.0
+pandas==2.2.0
+numpy==1.26.4
+
+# Feature Extraction & Deep Learning
+torch==2.1.2
+torchaudio==2.1.2
+torch-geometric==2.4.0
+ncps==0.0.7
+
+# Model Serving & MLOps
+vllm==0.2.7
+fastapi==0.109.0
+uvicorn==0.27.0
+mlflow==2.10.0
