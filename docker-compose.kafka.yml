@@ -16,6 +16,8 @@ services:
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
       # Automatically create our required topics on startup
       - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+      # REQUIRED: Bitnami will crash without this when using PLAINTEXT
+      - ALLOW_PLAINTEXT_LISTENER=yes
     volumes:
       - murmur_kafka_data:/bitnami/kafka
 
