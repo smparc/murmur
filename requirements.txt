@@ -1,22 +1,23 @@
-# Streaming & Orchestration
-confluent-kafka==2.3.0
-dagster==1.6.0
-dagster-webserver==1.6.0
+# --- Core Machine Learning ---
+torch>=2.1.2
+torch_geometric>=2.4.0
+scipy>=1.12.0
+numpy>=1.26.3
 
-# GPU Compute & Data Processing
-cupy-cuda12x==13.0.0
-cudf-cu12==24.2.0
-pandas==2.2.0
-numpy==1.26.4
+# --- Liquid Neural Networks (Time-Series Forecasting) ---
+ncps>=0.0.7
 
-# Feature Extraction & Deep Learning
-torch==2.1.2
-torchaudio==2.1.2
-torch-geometric==2.4.0
-ncps==0.0.7
+# --- Audio LLM Translation ---
+transformers>=4.37.2
+accelerate>=0.26.1
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.5.3
 
-# Model Serving & MLOps
-vllm==0.2.7
-fastapi==0.109.0
-uvicorn==0.27.0
-mlflow==2.10.0
+# --- Stream Ingestion & GPU Compute ---
+confluent-kafka>=2.3.0
+pycuda>=2024.1
+
+# --- MLOps & Orchestration ---
+dagster>=1.6.0
+mlflow>=2.9.2
