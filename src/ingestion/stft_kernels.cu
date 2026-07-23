@@ -9,7 +9,7 @@
 extern "C" {
 
     /**
-     * @brief Applies a pre-emphasis filter to the raw audio waveform.
+     *  Applies a pre-emphasis filter to the raw audio waveform.
      * Formula: y(t) = x(t) - alpha * x(t-1)
      */
     __global__ void pre_emphasis_kernel(const float* input, float* output, int length, float coeff) {
@@ -27,7 +27,7 @@ extern "C" {
     }
 
     /**
-     * @brief Applies a Hann Window to an audio frame prior to FFT.
+     * u/brief Applies a Hann Window to an audio frame prior to FFT.
      * This prevents spectral leakage at the edges of the audio chunks.
      */
     __global__ void apply_hann_window_kernel(float* frame, int frame_length) {
