@@ -3,17 +3,23 @@ FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
 
 WORKDIR /app
 
-# Install inference and serving dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the modeling and forecasting directories
+# Copy source code (need src/__init__.py + settings for imports)
+COPY src/__init__.py src/__init__.py
+COPY src/settings.py src/settings.py
 COPY src/mapping/ src/mapping/
 COPY src/translation/ src/translation/
 COPY src/forecasting/ src/forecasting/
+COPY src/detection/ src/detection/
+COPY src/observability/ src/observability/
 
-# Expose the FastAPI port
 EXPOSE 8000
 
-# Boot the LLM Telemetry Decoder via Uvicorn
+
+# Health check: hit /health every 30s
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
 CMD ["uvicorn", "src.translation.llm_decoder:app", "--host", "0.0.0.0", "--port", "8000"]

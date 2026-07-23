@@ -1,10 +1,8 @@
 # Use an official NVIDIA CUDA runtime as a parent image
 FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
 
-# Set non-interactive installation
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install Python and build dependencies
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-pip \
@@ -13,12 +11,12 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Install Python dependencies targeting the NVIDIA PyPI index
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt --extra-index-url https://pypi.nvidia.com
 
-# Copy the ingestion source code and CUDA kernels
+# Copy source code (need src/__init__.py + settings for imports)
+COPY src/__init__.py src/__init__.py
+COPY src/settings.py src/settings.py
 COPY src/ingestion/ src/ingestion/
 
-# Set the entrypoint to the Kafka consumer loop
 CMD ["python3", "src/ingestion/cuda_stream_processor.py"]

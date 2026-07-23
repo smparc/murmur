@@ -19,9 +19,22 @@ spec:
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
         resources:
           limits:
-            nvidia.com/gpu: 1 # Required to load the LLM into VRAM
+            nvidia.com/gpu: 1
           requests:
             cpu: "4"
             memory: "16Gi"
