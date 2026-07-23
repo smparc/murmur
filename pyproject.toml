@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "murmur"
+version = "1.0.0"
+description = "Enterprise spatio-temporal acoustic monitoring and predictive maintenance system"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Murmur Team"}]
+keywords = [
+    "acoustic-monitoring", "predictive-maintenance", "gnn",
+    "liquid-neural-networks", "kafka", "llm", "audio-ml",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Manufacturing",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+
+dependencies = [
+    "torch>=2.1.2",
+    "torchaudio>=2.1.2",
+    "torch_geometric>=2.4.0",
+    "scipy>=1.12.0",
+    "numpy>=1.26.3",
+    "ncps>=0.0.7",
+    "transformers>=4.37.2",
+    "accelerate>=0.26.1",
+    "fastapi>=0.109.0",
+    "uvicorn[standard]>=0.27.0",
+    "websockets>=12.0",
+    "pydantic>=2.5.3",
+    "confluent-kafka>=2.3.0",
+    "msgpack>=1.0.7",
+    "prometheus-client>=0.20.0",
+    "dagster>=1.6.0",
+    "mlflow>=2.9.2",
+]
+
+
+[project.optional-dependencies]
+cuda = ["pycuda>=2024.1"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.26",
+    "ruff>=0.1.0",
+]
+
+
+[tool.setuptools.packages.find]
+include = ["src*", "orchestration*"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+markers = ["integration: requires external services (Kafka, etc.)"]
+
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

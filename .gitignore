@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+
+# Models & artifacts
+models/*.pth
+models/*.onnx
+*.pth
+*.onnx
+
+
+# MLflow
+mlruns/
+mlartifacts/
+
+
+# Dagster
+.dagster/
+
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+# Node / Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+
+# Docker volumes
+murmur_kafka_data/
+
+
+# Coverage
+.coverage
+htmlcov/
+coverage.xml
+
+
+# Logs
+*.log
+
+
+# Jupyter
+.ipynb_checkpoints/
