@@ -74,8 +74,6 @@ class AcousticForecastingLNN(nn.Module):
         # parameters and better-conditioned temporal dynamics.
         wiring = AutoNCP(hidden_neurons, motor_neurons)
 
-        # return_sequences=True keeps the per-timestep states available, so the
-        # same core serves both a single forecast and a full trajectory.
         self.liquid_layer = CfC(input_dim, wiring, return_sequences=True)
 
         # A real head. The previous implementation projected the motor output
@@ -123,13 +121,49 @@ class AcousticForecastingLNN(nn.Module):
                 f"(batch, seq_len) = {tuple(x.shape[:2])}"
             )
 
-        liquid_out, _ = self.liquid_layer(x, timespans=timespans)  # (B, S, motor)
+        liquid_out = self._roll_out(x, timespans)  # (B, S, motor)
 
         if return_sequence:
             return self.activation(self.head(liquid_out))
 
         # The final state summarises the whole observed history.
         return self.activation(self.head(liquid_out[:, -1]))
+
+    def _roll_out(
+        self, x: torch.Tensor, timespans: torch.Tensor | None
+    ) -> torch.Tensor:
+        """
+        Step the liquid cell over the sequence.
+
+        This drives ``CfC``'s underlying cell directly instead of calling
+        ``CfC.forward``. Upstream reduces each step's timespan with
+        ``timespans[:, t].squeeze()``, producing a ``(batch,)`` vector that is
+        then multiplied against a ``(batch, units)`` activation — which only
+        broadcasts when ``units == batch``, and otherwise raises. Supplying
+        real per-sample timings therefore crashes for any batch above one,
+        which is precisely how the training loop calls it.
+
+        Reshaping to ``(batch, 1)`` broadcasts correctly and gives every sample
+        in the batch its own integration interval. ``CfC.fc`` is ``Identity``
+        under an explicit wiring, so nothing else is bypassed.
+        """
+        batch, seq_len, _ = x.shape
+        cell = self.liquid_layer.rnn_cell
+
+        state = torch.zeros(
+            batch, self.liquid_layer.state_size, device=x.device, dtype=x.dtype
+        )
+        outputs = []
+        for t in range(seq_len):
+            step_ts: torch.Tensor | float
+            if timespans is None:
+                step_ts = 1.0
+            else:
+                step_ts = timespans[:, t].reshape(batch, 1).to(dtype=x.dtype)
+            out, state = cell.forward(x[:, t], state, step_ts)
+            outputs.append(out)
+
+        return torch.stack(outputs, dim=1)
 
     @torch.no_grad()
     def predict_trajectory(
