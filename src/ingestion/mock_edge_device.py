@@ -101,8 +101,13 @@ def generate_mock_audio(
 
 
 
-def run_edge_simulation():
-    """Stream continuous audio to Kafka from simulated microphone nodes."""
+def run_edge_simulation(max_loops: int | None = None) -> int:
+    """
+    Stream continuous audio to Kafka from simulated microphone nodes.
+
+    ``max_loops`` bounds the run so this is testable without a background
+    thread. Returns the number of chunks streamed per node.
+    """
     producer = Producer({"bootstrap.servers": settings.KAFKA_BROKER})
     num_nodes = settings.NUM_NODES
 
@@ -124,7 +129,7 @@ def run_edge_simulation():
 
 
     try:
-        while True:
+        while max_loops is None or loop_count < max_loops:
             for node in range(num_nodes):
                 # Stochastic anomaly injection (not deterministic)
                 if node_degradation[node] == 0.0:
@@ -182,11 +187,18 @@ def run_edge_simulation():
     except KeyboardInterrupt:
         log.info("Stopping edge simulation.")
     finally:
-        producer.flush()
+        producer.flush(timeout=10)
 
-if __name__ == "__main__":
+    return loop_count
+
+
+def main() -> None:  # pragma: no cover
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     run_edge_simulation()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

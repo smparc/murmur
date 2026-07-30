@@ -1,1 +1,1 @@
-"""Training pipeline for murmur's ML models"""
+"""Training pipeline for Murmur's models."""

@@ -1,7 +1,5 @@
-"""
-Anomaly detection module — unsupervised baseline + online adaptive scoring.
-"""
-from .anomaly_detector import SpectrogramAutoencoder, AnomalyScorer
+"""Anomaly detection: unsupervised reconstruction baseline + online scoring."""
 
+from .anomaly_detector import AnomalyScorer, ScoreResult, SpectrogramAutoencoder
 
-__all__ = ["SpectrogramAutoencoder", "AnomalyScorer"]
+__all__ = ["AnomalyScorer", "ScoreResult", "SpectrogramAutoencoder"]
