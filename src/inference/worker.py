@@ -235,6 +235,7 @@ class InferenceWorker:
 
         self._client = http_client or httpx.Client(timeout=30.0)
         self._owns_client = http_client is None
+        self._throttled = 0
 
     def _load_weights(self) -> bool:
         """Load trained weights; fall back to energy-based scoring if absent."""
@@ -322,6 +323,20 @@ class InferenceWorker:
                 json=payload,
                 headers=headers,
             )
+            if response.status_code == 429:
+                # Backpressure, not a defect. Logged sparsely because the
+                # limiter rejects a whole snapshot at once and per-node warnings
+                # would bury everything else in the log.
+                PIPELINE_ERRORS.labels(stage="submit_throttled").inc()
+                self._throttled += 1
+                if self._throttled % 100 == 1:
+                    log.warning(
+                        "Telemetry API is rate limiting (%d rejected so far). "
+                        "Raise RATE_LIMIT_PER_MINUTE above the pipeline's "
+                        "steady-state rate of NUM_NODES per CHUNK_DURATION.",
+                        self._throttled,
+                    )
+                return False
             if response.status_code >= 400:
                 PIPELINE_ERRORS.labels(stage="submit").inc()
                 log.warning(

@@ -176,8 +176,12 @@ class Settings:
     CORS_ORIGINS: str = field(
         default_factory=lambda: _env_str("CORS_ORIGINS", "http://localhost:3000")
     )
+    # Must exceed the pipeline's own steady state or the limiter silently drops
+    # monitoring data. One snapshot per CHUNK_DURATION emits NUM_NODES requests,
+    # so a 4-mic array at 0.5s chunks sustains ~480/min; this leaves ~2.5x
+    # headroom for bursts and backfill. Set 0 to disable.
     RATE_LIMIT_PER_MINUTE: int = field(
-        default_factory=lambda: _env_int("RATE_LIMIT_PER_MINUTE", 120)
+        default_factory=lambda: _env_int("RATE_LIMIT_PER_MINUTE", 1200)
     )
 
     # -- Topology --
