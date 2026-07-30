@@ -127,9 +127,12 @@ def generate_degradation_data(
     fault_names = list(_FAULT_PROFILES)
 
     for i in range(num_sequences):
-        # Ambient floor is identical for healthy and degrading machines, so the
-        # label cannot be recovered from overall signal energy alone.
-        signal = rng.normal(0.0, ambient_level, size=(seq_length, num_nodes, in_channels))
+        # The ambient floor varies per sequence and is independent of the label,
+        # so a loud healthy machine can out-energise a quiet degrading one. That
+        # deliberately removes "total loudness" as a shortcut and forces the
+        # model onto the spectral, spatial and temporal structure of the fault.
+        floor = ambient_level * float(rng.uniform(0.6, 1.7))
+        signal = rng.normal(0.0, floor, size=(seq_length, num_nodes, in_channels))
 
         if rng.random() < anomaly_ratio:
             severity = float(rng.uniform(0.5, 1.0))
