@@ -1,25 +1,56 @@
-version: "3.8"
+# Local Kafka broker for development.
+#
+# The advertised listeners are the important part. A broker tells clients which
+# address to reconnect on, and without an explicit setting Bitnami advertises
+# the container hostname — so a client on the host connects to localhost:9092,
+# is redirected to "murmur-kafka-broker:9092", and fails to resolve it. Two
+# listeners are declared: EXTERNAL for host tooling, INTERNAL for other
+# containers on the compose network.
 
 services:
   kafka:
-    image: docker.io/bitnami/kafka:3.5
+    image: docker.io/bitnami/kafka:3.7
     container_name: murmur-kafka-broker
     ports:
       - "9092:9092"
     environment:
-      # Run Kafka in KRaft mode (No Zookeeper required)
+      # --- KRaft mode (no Zookeeper) ---
       - KAFKA_CFG_NODE_ID=1
       - KAFKA_CFG_PROCESS_ROLES=controller,broker
-      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
-      # Automatically create our required topics on startup
-      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
-      # REQUIRED: Bitnami will crash without this when using PLAINTEXT
+
+      # --- Listeners ---
+      - KAFKA_CFG_LISTENERS=INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
+
+      # --- Topics ---
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      # Single-broker development cluster: replication cannot exceed one.
+      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR=1
+      # Audio is high volume and only useful while fresh.
+      - KAFKA_CFG_LOG_RETENTION_HOURS=6
+      - KAFKA_CFG_MESSAGE_MAX_BYTES=10485760
+
       - ALLOW_PLAINTEXT_LISTENER=yes
     volumes:
       - murmur_kafka_data:/bitnami/kafka
+    healthcheck:
+      # Compose dependents can then wait for a broker that actually accepts
+      # client connections, rather than merely a running container.
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
 
 volumes:
   murmur_kafka_data:
