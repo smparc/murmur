@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "Menlo", monospace;
+}
+
+html,
+body {
+  background-color: rgb(3 7 18);
+  color: rgb(243 244 246);
+}
+
+/* Keeps the telemetry feed readable without a heavyweight scrollbar library. */
+.scroll-slim::-webkit-scrollbar {
+  width: 6px;
+}
+.scroll-slim::-webkit-scrollbar-thumb {
+  background-color: rgb(55 65 81);
+  border-radius: 3px;
+}
