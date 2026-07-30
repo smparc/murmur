@@ -1,19 +1,25 @@
 """
-Spatio-Temporal Graph Neural Network (ST-GNN) for acoustic source localization
-and feature extraction.
+Spatio-Temporal Graph Neural Network (ST-GNN) for acoustic feature extraction.
 
+The factory floor is modelled as a graph:
 
-The network models the factory floor as a topological graph where:
-- Nodes = microphone positions
-- Edges = acoustic coupling between nearby sensors (inverse-distance weighted)
+- **Nodes** — microphone positions
+- **Edges** — acoustic coupling between nearby sensors (distance-weighted)
 
+Pipeline::
 
-Architecture:
-    1. Per-node temporal attention (captures frequency drift over time)
-    2. Spatial GCN layers (propagates spatial acoustic correlations)
-    3. Graph-level readout → dense embedding for downstream LLM / LNN
+    spectrograms -> temporal attention -> spatial GCN -> readout -> embedding
+
+The model can emit either a single graph-level embedding (``(B, E)``) or a full
+per-timestep sequence (``(B, S, E)``). The sequence form exists because the
+downstream Liquid Network is a *continuous-time* model: feeding it a single
+pooled vector repeated across time gives it a constant signal and wastes the
+entire reason for choosing that architecture.
 """
 
+from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -21,17 +27,58 @@ import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, global_mean_pool
 
 
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Fixed sinusoidal position signal added before temporal self-attention.
+
+    Self-attention is permutation-invariant: without this, reversing or
+    shuffling a node's spectrogram frames yields a bit-identical embedding.
+    For a model whose purpose is detecting *temporal* signatures — a bearing
+    fault ramping up, a transient impulse train — that is a silent correctness
+    bug, not a refinement.
+
+    Sinusoidal rather than learned, so a model trained at one window length
+    still behaves sensibly if ``SEQ_LENGTH`` is retuned in production.
+    """
+
+    def __init__(self, dim: int, max_len: int = 4096):
+        super().__init__()
+        if dim % 2:
+            raise ValueError(f"positional encoding dim must be even, got {dim}")
+
+        position = torch.arange(max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10_000.0) / dim))
+        pe = torch.zeros(max_len, dim)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
+        self.max_len = max_len
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``(B, S, D)`` -> ``(B, S, D)``."""
+        seq_len = x.size(1)
+        if seq_len > self.max_len:
+            raise ValueError(
+                f"sequence length {seq_len} exceeds positional encoding capacity {self.max_len}"
+            )
+        return x + self.pe[:, :seq_len]
+
 
 class TemporalAttentionBlock(nn.Module):
     """
-    Multi-head self-attention over the time axis of each node's spectrogram
-    sequence. Captures temporal patterns like frequency drift, transient
-    impulses, and periodic machinery signatures.
-    """
+    Pre-norm multi-head self-attention over a node's spectrogram sequence.
 
+    Captures frequency drift, transient impulses and periodic machinery
+    signatures. Pre-norm (normalise then attend, add residual) is used rather
+    than post-norm because it trains stably without a warmup schedule.
+    """
 
     def __init__(self, input_dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
+        if input_dim % num_heads:
+            raise ValueError(
+                f"input_dim ({input_dim}) must be divisible by num_heads ({num_heads})"
+            )
         self.attention = nn.MultiheadAttention(
             embed_dim=input_dim,
             num_heads=num_heads,
@@ -39,97 +86,85 @@ class TemporalAttentionBlock(nn.Module):
             batch_first=True,
         )
         self.norm = nn.LayerNorm(input_dim)
+        self.ffn_norm = nn.LayerNorm(input_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(input_dim, input_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim * 2, input_dim),
+        )
         self.dropout = nn.Dropout(dropout)
 
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (batch * num_nodes, seq_len, features)
-        Returns:
-            (batch * num_nodes, seq_len, features)
-        """
-        attn_out, _ = self.attention(x, x, x)
-        return self.norm(x + self.dropout(attn_out))
-
+        """``(B * num_nodes, seq_len, features)`` in and out."""
+        h = self.norm(x)
+        attn_out, _ = self.attention(h, h, h, need_weights=False)
+        x = x + self.dropout(attn_out)
+        return x + self.dropout(self.ffn(self.ffn_norm(x)))
 
 
 class SpatialGCNBlock(nn.Module):
-    """
-    Two-layer Graph Convolutional block that propagates acoustic information
-    across physically connected microphone nodes.
-    """
+    """Two-layer residual graph convolution across physically coupled nodes."""
 
-
-    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int,
-                 dropout: float = 0.1):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        out_channels: int,
+        dropout: float = 0.1,
+    ):
         super().__init__()
         self.conv1 = GCNConv(in_channels, hidden_channels)
         self.conv2 = GCNConv(hidden_channels, out_channels)
         self.norm1 = nn.LayerNorm(hidden_channels)
         self.norm2 = nn.LayerNorm(out_channels)
         self.dropout = nn.Dropout(dropout)
-
-
-        # Residual projection if dimensions change
         self.residual = (
             nn.Linear(in_channels, out_channels)
             if in_channels != out_channels
             else nn.Identity()
         )
 
-
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor,
-                edge_weight: torch.Tensor = None) -> torch.Tensor:
-        """
-        Args:
-            x: (num_nodes_total, features)
-            edge_index: (2, num_edges)
-            edge_weight: (num_edges,)
-        Returns:
-            (num_nodes_total, out_channels)
-        """
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``(num_nodes_total, features)`` -> ``(num_nodes_total, out_channels)``."""
         identity = self.residual(x)
 
-
         out = self.conv1(x, edge_index, edge_weight)
-        out = self.norm1(out)
-        out = F.gelu(out)
+        out = F.gelu(self.norm1(out))
         out = self.dropout(out)
-
 
         out = self.conv2(out, edge_index, edge_weight)
         out = self.norm2(out)
 
-
         return F.gelu(out + identity)
-
 
 
 class SpatioTemporalGNN(nn.Module):
     """
-    Full ST-GNN pipeline:
-        Raw spectrograms → Temporal Attention → Spatial GCN → Graph Readout → Embedding
-
+    Full ST-GNN.
 
     Parameters
     ----------
-    in_channels : int
-        Feature dimension per node per timestep (e.g., 64 mel bins).
-    hidden_channels : int
-        Width of GCN hidden layers.
-    embedding_dim : int
-        Output embedding size fed to downstream LLM / LNN.
-    num_nodes : int
-        Number of microphone nodes in the topology.
-    num_heads : int
-        Attention heads for temporal self-attention.
-    num_gcn_layers : int
-        Number of stacked spatial GCN blocks.
-    dropout : float
-        Dropout probability throughout the network.
+    in_channels:
+        Features per node per timestep (mel bins).
+    hidden_channels:
+        Width of the attention and GCN stack.
+    embedding_dim:
+        Output embedding size consumed by the LLM and LNN.
+    num_nodes:
+        Microphones in the topology.
+    num_heads:
+        Temporal attention heads.
+    num_gcn_layers:
+        Stacked spatial GCN blocks.
+    dropout:
+        Dropout probability throughout.
     """
-
 
     def __init__(
         self,
@@ -142,30 +177,28 @@ class SpatioTemporalGNN(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        if num_gcn_layers < 1:
+            raise ValueError(f"num_gcn_layers must be >= 1, got {num_gcn_layers}")
+
         self.num_nodes = num_nodes
         self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
         self.embedding_dim = embedding_dim
 
-
-        # -- Stage 1: Temporal feature extraction per node --
+        # -- Stage 1: temporal feature extraction, per node --
         self.input_proj = nn.Linear(in_channels, hidden_channels)
+        self.pos_encoding = SinusoidalPositionalEncoding(hidden_channels)
         self.temporal_attention = TemporalAttentionBlock(
             hidden_channels, num_heads=num_heads, dropout=dropout
         )
-        # Collapse the temporal dimension into a fixed-size vector
-        self.temporal_pool = nn.AdaptiveAvgPool1d(1)
 
+        # -- Stage 2: spatial propagation --
+        self.gcn_blocks = nn.ModuleList(
+            SpatialGCNBlock(hidden_channels, hidden_channels, hidden_channels, dropout=dropout)
+            for _ in range(num_gcn_layers)
+        )
 
-        # -- Stage 2: Spatial GCN layers --
-        self.gcn_blocks = nn.ModuleList()
-        for i in range(num_gcn_layers):
-            c_in = hidden_channels if i == 0 else hidden_channels
-            self.gcn_blocks.append(
-                SpatialGCNBlock(c_in, hidden_channels, hidden_channels, dropout=dropout)
-            )
-
-
-        # -- Stage 3: Graph readout → dense embedding --
+        # -- Stage 3: graph readout --
         self.readout = nn.Sequential(
             nn.Linear(hidden_channels, embedding_dim),
             nn.LayerNorm(embedding_dim),
@@ -174,119 +207,145 @@ class SpatioTemporalGNN(nn.Module):
             nn.Linear(embedding_dim, embedding_dim),
         )
 
+        # Expanding the topology to cover a batch of graphs is pure index
+        # arithmetic that depends only on (num_graphs, device). Recomputing it
+        # every forward pass — as the previous implementation did, with a Python
+        # loop and a host-to-device copy — is wasted work on the hot path.
+        self._edge_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor | None]] = {}
+
+    def _batched_topology(
+        self,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor | None,
+        num_graphs: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Replicate the topology across ``num_graphs`` disjoint graphs."""
+        key = (
+            num_graphs,
+            str(device),
+            int(edge_index.shape[1]),
+            edge_index.data_ptr(),
+            None if edge_weight is None else edge_weight.data_ptr(),
+        )
+        cached = self._edge_cache.get(key)
+        if cached is not None:
+            return cached
+
+        edge_index = edge_index.to(device)
+        # (2, E) -> (G, 2, E) via broadcast offsets -> (2, G*E)
+        offsets = (torch.arange(num_graphs, device=device) * self.num_nodes).view(-1, 1, 1)
+        batched_index = (edge_index.unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, -1)
+
+        batched_weight = None
+        if edge_weight is not None:
+            batched_weight = edge_weight.to(device).repeat(num_graphs)
+
+        # Bounded so a service that sees many distinct batch sizes cannot grow
+        # this without limit.
+        if len(self._edge_cache) > 32:
+            self._edge_cache.clear()
+        self._edge_cache[key] = (batched_index, batched_weight)
+        return batched_index, batched_weight
 
     def forward(
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
-        edge_weight: torch.Tensor = None,
-        batch_size: int = None,
-        seq_length: int = None,
+        edge_weight: torch.Tensor | None = None,
+        return_sequence: bool = False,
     ) -> torch.Tensor:
         """
-        Forward pass.
+        Parameters
+        ----------
+        x:
+            ``(B, S, num_nodes * in_channels)`` flattened, or
+            ``(B, S, num_nodes, in_channels)`` structured.
+        edge_index:
+            ``(2, num_edges)`` topology.
+        edge_weight:
+            ``(num_edges,)`` coupling strengths.
+        return_sequence:
+            When ``True``, return a per-timestep embedding sequence
+            ``(B, S, embedding_dim)`` for continuous-time consumers. When
+            ``False``, mean-pool over time to a single ``(B, embedding_dim)``.
 
-
-        Args:
-            x: (batch, seq_len, num_nodes * in_channels)  — flattened node features
-               OR (batch, seq_len, num_nodes, in_channels) — structured
-            edge_index: (2, num_edges) — graph topology
-            edge_weight: (num_edges,) — edge weights
-            batch_size: int — inferred from x if not provided
-            seq_length: int — inferred from x if not provided
-
-
-        Returns:
-            embeddings: (batch, embedding_dim) — graph-level acoustic embedding
+        Returns
+        -------
+        ``(B, embedding_dim)`` or ``(B, S, embedding_dim)``.
         """
-        # -- Reshape input --
         if x.dim() == 3:
-            # (batch, seq, nodes*features) → (batch, seq, nodes, features)
-            B, S, _ = x.shape
+            B, S, flat = x.shape
+            expected = self.num_nodes * self.in_channels
+            if flat != expected:
+                raise ValueError(
+                    f"expected {expected} features (num_nodes * in_channels), got {flat}"
+                )
             x = x.view(B, S, self.num_nodes, self.in_channels)
-        else:
+        elif x.dim() == 4:
             B, S = x.shape[0], x.shape[1]
-
-
-        # -- Stage 1: Temporal attention per node --
-        # Reshape to (B * num_nodes, S, in_channels) so each node gets its own
-        # temporal attention pass
-        x = x.permute(0, 2, 1, 3).contiguous()  # (B, nodes, S, C)
-        x = x.view(B * self.num_nodes, S, self.in_channels)
-
-
-        x = self.input_proj(x)                    # (B*nodes, S, hidden)
-        x = self.temporal_attention(x)             # (B*nodes, S, hidden)
-
-
-        # Pool over time: (B*nodes, S, hidden) → (B*nodes, hidden)
-        x = x.permute(0, 2, 1)                    # (B*nodes, hidden, S)
-        x = self.temporal_pool(x).squeeze(-1)      # (B*nodes, hidden)
-
-
-        # -- Stage 2: Spatial GCN --
-        # We need to expand edge_index for the full batch (B graphs in parallel).
-        # PyG convention: offset node indices per graph in the batch.
-        N = self.num_nodes
-        device = x.device
-
-
-        # Build batched edge_index by offsetting each graph's node indices
-        batch_edge_indices = []
-        for b in range(B):
-            batch_edge_indices.append(edge_index + b * N)
-        batched_edge_index = torch.cat(batch_edge_indices, dim=1).to(device)
-
-
-        # Repeat edge weights for each graph in the batch
-        if edge_weight is not None:
-            batched_edge_weight = edge_weight.repeat(B).to(device)
+            if x.shape[2] != self.num_nodes or x.shape[3] != self.in_channels:
+                raise ValueError(
+                    f"expected (B, S, {self.num_nodes}, {self.in_channels}), got {tuple(x.shape)}"
+                )
         else:
-            batched_edge_weight = None
+            raise ValueError(f"expected a 3D or 4D input, got {x.dim()}D")
 
+        N, device = self.num_nodes, x.device
 
+        # -- Stage 1: temporal attention, independently per node --
+        # (B, S, N, C) -> (B*N, S, C) so each microphone attends over its own
+        # history without leaking across the array.
+        h = x.permute(0, 2, 1, 3).reshape(B * N, S, self.in_channels)
+        h = self.input_proj(h)
+        h = self.pos_encoding(h)
+        h = self.temporal_attention(h)  # (B*N, S, hidden)
+
+        # -- Stage 2: spatial GCN at every timestep --
+        # Treat each (batch, timestep) pair as its own graph, so B*S disjoint
+        # copies of the topology are convolved in a single call.
+        h = h.view(B, N, S, self.hidden_channels).permute(0, 2, 1, 3)  # (B, S, N, hidden)
+        h = h.reshape(B * S * N, self.hidden_channels)
+
+        num_graphs = B * S
+        batched_index, batched_weight = self._batched_topology(
+            edge_index, edge_weight, num_graphs, device
+        )
         for gcn_block in self.gcn_blocks:
-            x = gcn_block(x, batched_edge_index, batched_edge_weight)
+            h = gcn_block(h, batched_index, batched_weight)
+
+        # -- Stage 3: readout, one embedding per (batch, timestep) --
+        batch_vec = torch.arange(num_graphs, device=device).repeat_interleave(N)
+        pooled = global_mean_pool(h, batch_vec)  # (B*S, hidden)
+        embeddings = self.readout(pooled).view(B, S, self.embedding_dim)
+
+        if return_sequence:
+            return embeddings
+        return embeddings.mean(dim=1)
 
 
-        # -- Stage 3: Graph readout --
-        # Create a batch vector for global_mean_pool: [0,0,0,0, 1,1,1,1, ...]
-        batch_vec = torch.arange(B, device=device).repeat_interleave(N)
-        x = global_mean_pool(x, batch_vec)         # (B, hidden)
+def main() -> None:  # pragma: no cover - manual inspection helper
+    from src.mapping.topology_graph import build_acoustic_topology
+    from src.settings import settings
 
-
-        embeddings = self.readout(x)               # (B, embedding_dim)
-        return embeddings
-
-
-
-if __name__ == "__main__":
-    # Quick sanity test
-    from topology_graph import build_acoustic_topology
-
-
-    mics = [
-        (0.0, 0.0, 3.0),
-        (5.0, 0.0, 3.0),
-        (0.0, 10.0, 3.0),
-        (5.0, 10.0, 3.0),
-    ]
-    edge_index, edge_weight = build_acoustic_topology(mics)
-
-
-    model = SpatioTemporalGNN(
-        in_channels=64,
-        hidden_channels=128,
-        embedding_dim=256,
-        num_nodes=4,
+    edge_index, edge_weight = build_acoustic_topology(
+        settings.MIC_COORDS, settings.DISTANCE_THRESHOLD
     )
+    model = SpatioTemporalGNN(
+        in_channels=settings.GNN_IN_CHANNELS,
+        hidden_channels=settings.GNN_HIDDEN_CHANNELS,
+        embedding_dim=settings.GNN_EMBEDDING_DIM,
+        num_nodes=settings.NUM_NODES,
+    )
+    x = torch.randn(8, settings.SEQ_LENGTH, settings.NUM_NODES * settings.GNN_IN_CHANNELS)
+
+    pooled = model(x, edge_index, edge_weight)
+    sequence = model(x, edge_index, edge_weight, return_sequence=True)
+
+    print(f"[*] Pooled embedding:   {tuple(pooled.shape)}")
+    print(f"[*] Sequence embedding: {tuple(sequence.shape)}")
+    print(f"[*] Parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
 
-    # Simulated input: 8 batches, 50 timesteps, 4 nodes * 64 mel bins
-    x = torch.randn(8, 50, 4 * 64)
-    out = model(x, edge_index, edge_weight)
-
-
-    n_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"[*] ST-GNN output: {out.shape}")       # (8, 256)
-    print(f"[*] Parameters: {n_params:.2f}M")
+if __name__ == "__main__":  # pragma: no cover
+    main()
