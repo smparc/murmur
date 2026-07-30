@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+# A newer push to the same branch cancels the in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  INGEST_IMAGE_NAME: ${{ github.repository_owner }}/murmur-ingest
+  INFERENCE_IMAGE_NAME: ${{ github.repository_owner }}/murmur-inference
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install ruff==0.16.1
+
+      - name: ruff check
+        run: ruff check src/ tests/ orchestration/
+
+      - name: ruff format --check
+        run: ruff format --check src/ tests/ orchestration/
+
+  test:
+    name: Test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # CPU-only wheels keep the runner fast; CUDA is exercised in the image build.
+      - name: Install torch (CPU)
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+
+      - name: Install package
+        run: pip install -e ".[dev]"
+
+      - name: Run unit tests
+        run: pytest tests/ -m "not integration" --cov=src --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          if-no-files-found: warn
+
+  integration:
+    name: Integration (Kafka)
+    runs-on: ubuntu-latest
+    services:
+      kafka:
+        image: apache/kafka:3.7.0
+        ports:
+          - 9092:9092
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install torch (CPU)
+        run: pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+
+      - name: Install package
+        run: pip install -e ".[dev]"
+
+      - name: Wait for Kafka
+        run: |
+          for i in $(seq 1 30); do
+            if timeout 1 bash -c '</dev/tcp/localhost/9092'; then
+              echo "Kafka is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Kafka did not become ready in time" >&2
+          exit 1
+
+      - name: Run integration tests
+        run: pytest tests/ -m integration
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci` needs a lockfile; fall back to `install` until one is committed.
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  build-images:
+    name: Build & push images
+    needs: [lint, test, frontend]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - image: INGEST_IMAGE_NAME
+            dockerfile: deploy/Dockerfile.ingest
+          - image: INFERENCE_IMAGE_NAME
+            dockerfile: deploy/Dockerfile.inference
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env[matrix.image] }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  validate-k8s:
+    name: Validate K8s manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -sSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform.tar.gz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate manifests
+        run: kubeconform -strict -summary -ignore-missing-schemas deploy/k8s/
