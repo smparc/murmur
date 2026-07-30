@@ -1,8 +1,28 @@
+# Telemetry API — FastAPI + WebSocket, GPU-resident LLM.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: murmur-inference
+  namespace: murmur
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: murmur-secrets
+  namespace: murmur
+type: Opaque
+stringData:
+  # Replace before deploying. An empty key disables authentication entirely,
+  # and this Service is internet-reachable.
+  MURMUR_API_KEY: "change-me-before-deploying"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: murmur-inference-server
-  namespace: default
+  namespace: murmur
+  labels:
+    app: murmur-inference
 spec:
   replicas: 1
   selector:
@@ -12,45 +32,191 @@ spec:
     metadata:
       labels:
         app: murmur-inference
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
+      serviceAccountName: murmur-inference
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
       containers:
-      - name: inference-api
-        image: murmur-inference:latest
-        imagePullPolicy: IfNotPresent
-        ports:
-        - containerPort: 8000
-        livenessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 120
-          periodSeconds: 30
-          failureThreshold: 3
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 60
-          periodSeconds: 10
-        resources:
-          limits:
-            nvidia.com/gpu: 1
-          requests:
-            cpu: "4"
-            memory: "16Gi"
+        - name: inference-api
+          image: ghcr.io/smparc/murmur-inference:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: murmur-config
+          env:
+            - name: MURMUR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: murmur-secrets
+                  key: MURMUR_API_KEY
+          # Liveness hits /health (up), readiness hits /ready (models resident).
+          # Pointing both at the same endpoint — as before — means a pod that is
+          # merely slow to warm up gets killed rather than held out of rotation.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            # Allows up to 10 minutes for a multi-gigabyte model download
+            # without weakening the steady-state liveness check.
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              nvidia.com/gpu: 1
+              cpu: "8"
+              memory: "24Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+            - name: hf-cache
+              mountPath: /app/.cache/huggingface
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: murmur-models
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: 20Gi
       nodeSelector:
         nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+---
+# Streaming worker: consumes windowed spectrograms, runs the model chain and
+# posts telemetry. This is the service that joins ingestion to serving; without
+# it the topics are written and never read.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: murmur-inference-worker
+  namespace: murmur
+  labels:
+    app: murmur-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: murmur-worker
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: murmur-worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: worker
+          image: ghcr.io/smparc/murmur-inference:latest
+          imagePullPolicy: IfNotPresent
+          command: ["murmur-worker"]
+          envFrom:
+            - configMapRef:
+                name: murmur-config
+          env:
+            - name: MURMUR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: murmur-secrets
+                  key: MURMUR_API_KEY
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              nvidia.com/gpu: 1
+              cpu: "4"
+              memory: "12Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: models
+              mountPath: /app/models
+              readOnly: true
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: murmur-models
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: murmur-models
+  namespace: murmur
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 10Gi
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: murmur-inference-service
-  namespace: default
+  namespace: murmur
 spec:
   type: LoadBalancer
   selector:
     app: murmur-inference
   ports:
-    - protocol: TCP
+    - name: http
+      protocol: TCP
       port: 80
-      targetPort: 8000
+      targetPort: http
+---
+# Keeps at least one replica serving through voluntary disruptions such as a
+# node drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: murmur-inference-pdb
+  namespace: murmur
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: murmur-inference

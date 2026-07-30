@@ -1,19 +1,85 @@
+# Autoscaling for the telemetry API.
+#
+# Two caveats worth being explicit about, because the previous manifest was
+# quietly wrong on both:
+#
+# 1. Each replica requests a whole GPU, so maxReplicas is bounded by the number
+#    of GPUs in the cluster, not by CPU headroom. Scaling to 5 needs 5 GPUs.
+# 2. The workload is GPU-bound. A CPU-utilisation target scales on the wrong
+#    signal — it will sit under target while the GPU saturates. The custom
+#    metrics below are the real load signals; they require a metrics adapter
+#    (e.g. prometheus-adapter) to be installed, and the CPU metric is retained
+#    only as a fallback so this manifest still functions without one.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: murmur-inference-hpa
-  namespace: default
+  namespace: murmur
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: murmur-inference-server
   minReplicas: 1
-  maxReplicas: 5
+  maxReplicas: 4
   metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 75
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+    # Request rate per pod — the load the service is actually under.
+    - type: Pods
+      pods:
+        metric:
+          name: murmur_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "20"
+  behavior:
+    scaleUp:
+      # Acoustic events arrive in bursts; react quickly.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      # Model load takes minutes, so shedding a warm replica is expensive.
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+---
+# The worker scales on Kafka backlog, which is the correct signal for a
+# queue-driven consumer: lag rising means the pipeline is falling behind the
+# edge devices regardless of CPU or GPU utilisation.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: murmur-worker-hpa
+  namespace: murmur
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: murmur-inference-worker
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: murmur_kafka_consumer_lag
+        target:
+          type: AverageValue
+          averageValue: "500"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300

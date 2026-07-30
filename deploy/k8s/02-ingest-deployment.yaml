@@ -1,30 +1,87 @@
+# GPU ingestion workers.
+#
+# IMPORTANT — this workload is stateful. Each replica holds an in-process
+# sliding window of SEQ_LENGTH frames per microphone. Frames are produced with
+# the node id as the Kafka key, so a given microphone always lands on the same
+# partition and therefore on the same consumer. Replica count must not exceed
+# the partition count of the raw topic, or replicas will idle while holding a
+# GPU; and a rebalance necessarily rebuilds the window (SEQ_LENGTH frames of
+# warmup) on whichever pod takes over.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: murmur-config
+  namespace: murmur
+data:
+  KAFKA_BROKER: "murmur-kafka-broker:9092"
+  RAW_TOPIC: "raw-audio-stream"
+  PROCESSED_TOPIC: "spectrogram-embeddings"
+  SAMPLE_RATE: "16000"
+  N_MELS: "64"
+  SEQ_LENGTH: "50"
+  GNN_EMBEDDING_DIM: "256"
+  MODEL_DIR: "/app/models"
+  INFERENCE_URL: "http://murmur-inference-service"
+  CORS_ORIGINS: "http://localhost:3000"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: murmur-ingest-worker
-  namespace: default
+  namespace: murmur
+  labels:
+    app: murmur-ingest
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: murmur-ingest
+  strategy:
+    # Never run two pods against the same partition set mid-rollout: the old
+    # and new pod would each hold half a window.
+    type: Recreate
   template:
     metadata:
       labels:
         app: murmur-ingest
     spec:
+      # Give Kafka time to finish a clean rebalance before the pod is killed.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
       containers:
-      - name: ingest-processor
-        image: murmur-ingest:latest
-        imagePullPolicy: IfNotPresent
-        env:
-        - name: KAFKA_BROKER
-          value: "murmur-kafka-broker:9092"
-        resources:
-          limits:
-            nvidia.com/gpu: 1 # Request exclusive GPU access for CUDA STFT
-          requests:
-            cpu: "2"
-            memory: "4Gi"
+        - name: ingest-processor
+          image: ghcr.io/smparc/murmur-ingest:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: murmur-config
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              # GPU requests must equal limits; Kubernetes does not overcommit
+              # them. CPU and memory limits were previously absent entirely,
+              # so a leak could evict neighbouring pods.
+              nvidia.com/gpu: 1
+              cpu: "4"
+              memory: "8Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            exec:
+              command: ["python", "-c", "import torch, confluent_kafka"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
       nodeSelector:
         nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
