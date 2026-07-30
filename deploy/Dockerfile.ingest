@@ -1,22 +1,45 @@
-# Use an official NVIDIA CUDA runtime as a parent image
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+# Ingestion: Kafka -> GPU mel-spectrogram -> windowed republish.
+#
+# Built on the PyTorch CUDA image rather than a bare nvidia/cuda base. The
+# previous Dockerfile installed torch from PyPI on top of nvidia/cuda, which
+# resolves to the CPU-only wheel — so the "GPU-accelerated" container silently
+# ran every spectrogram on the CPU.
 
-ENV DEBIAN_FRONTEND=noninteractive
+FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime AS base
 
-RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3-pip \
-    build-essential \
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# librdkafka is required by confluent-kafka's wheel at runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        librdkafka1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt --extra-index-url https://pypi.nvidia.com
+# Dependency layer first: source changes then do not invalidate the (slow)
+# dependency install.
+COPY pyproject.toml README.md ./
+COPY src/__init__.py ./src/__init__.py
+RUN pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu121 \
+        "." \
+    && pip uninstall -y murmur
 
-# Copy source code (need src/__init__.py + settings for imports)
-COPY src/__init__.py src/__init__.py
-COPY src/settings.py src/settings.py
-COPY src/ingestion/ src/ingestion/
+COPY src/ ./src/
 
-CMD ["python3", "src/ingestion/cuda_stream_processor.py"]
+RUN pip install --no-cache-dir --no-deps .
+
+# Non-root: a container that processes untrusted network input should not be
+# able to write to its own image.
+RUN useradd --create-home --uid 10001 murmur \
+    && chown -R murmur:murmur /app
+USER murmur
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import torch, confluent_kafka" || exit 1
+
+ENTRYPOINT ["murmur-ingest"]

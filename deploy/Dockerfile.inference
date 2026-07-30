@@ -1,25 +1,49 @@
-# Use a PyTorch base image with pre-configured CUDA support
-FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+# Inference: telemetry API (FastAPI + WebSocket) and the streaming worker.
+#
+# One image serves both entrypoints — they share the entire model stack, and
+# publishing two near-identical multi-gigabyte images to save one process's
+# worth of code is a poor trade.
+
+FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/app/.cache/huggingface
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        librdkafka1 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml README.md ./
+COPY src/__init__.py ./src/__init__.py
+# Runtime dependencies only. The MLOps extra (dagster, mlflow) adds well over a
+# gigabyte and is needed by the training and orchestration entrypoints, not by
+# the serving path — it was previously pulled into both images via a shared
+# requirements.txt that also carried pytest and ruff.
+RUN pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu121 \
+        "." \
+    && pip uninstall -y murmur
 
-# Copy source code (need src/__init__.py + settings for imports)
-COPY src/__init__.py src/__init__.py
-COPY src/settings.py src/settings.py
-COPY src/mapping/ src/mapping/
-COPY src/translation/ src/translation/
-COPY src/forecasting/ src/forecasting/
-COPY src/detection/ src/detection/
-COPY src/observability/ src/observability/
+COPY src/ ./src/
+
+RUN pip install --no-cache-dir --no-deps .
+
+RUN useradd --create-home --uid 10001 murmur \
+    && mkdir -p /app/models /app/.cache/huggingface \
+    && chown -R murmur:murmur /app
+USER murmur
 
 EXPOSE 8000
 
+# Probes readiness, not just liveness: a pod whose models have not finished
+# loading should not be advertised as able to serve.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+    CMD curl -fsS http://localhost:8000/health || exit 1
 
-# Health check: hit /health every 30s
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
-
-CMD ["uvicorn", "src.translation.llm_decoder:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["uvicorn", "src.translation.llm_decoder:app", "--host", "0.0.0.0", "--port", "8000"]

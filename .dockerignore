@@ -1,0 +1,39 @@
+# Build context hygiene: without this the whole repo — including .git, the
+# virtualenv, node_modules and trained weights — is uploaded to the daemon on
+# every build.
+.git/
+.github/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+models/
+mlruns/
+mlartifacts/
+.dagster/
+
+tests/
+docs/
+*.md
+!README.md
+
+.coverage
+htmlcov/
+coverage.xml
+.pytest_cache/
+.ruff_cache/
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
