@@ -164,6 +164,24 @@ class TestAuth:
         """Kubernetes probes cannot present credentials."""
         assert secured_client.get("/health").status_code == 200
 
+    def test_metrics_requires_a_key(self, secured_client):
+        """
+        The exposition carries per-node anomaly counts, z-scores and TTF
+        forecasts — a live map of which machines are failing. On a LoadBalancer
+        Service that was public whenever an API key was configured.
+        """
+        assert secured_client.get("/metrics").status_code == 401
+        assert (
+            secured_client.get("/metrics", headers={"X-API-Key": "test-key"}).status_code == 200
+        )
+
+    def test_metrics_can_be_opened_for_in_cluster_scrapers(
+        self, secured_client, override_settings
+    ):
+        """A Prometheus that cannot present a key needs an escape hatch."""
+        override_settings(METRICS_REQUIRE_AUTH=False)
+        assert secured_client.get("/metrics").status_code == 200
+
 
 class TestRateLimit:
     def test_burst_beyond_limit_is_throttled(self, api_client, override_settings):
@@ -177,4 +195,45 @@ class TestRateLimit:
             for _ in range(8)
         ]
         assert 429 in codes
+
+    def test_bucket_map_is_bounded_across_distinct_keys(self, override_settings):
+        """
+        The limiter must not become the exhaustion vector it prevents.
+
+        Buckets are keyed by API key or client address — both attacker-supplied
+        on a public endpoint — and were only ever trimmed *within* a key, never
+        across keys, and cleared only at shutdown. One request per spoofed
+        source grew the map without bound.
+        """
+        override_settings(RATE_LIMIT_MAX_KEYS=100)
+        from src.translation.llm_decoder import state
+
+        state._rate_buckets.clear()
+        state._last_sweep = 0.0
+
+        now = time.monotonic()
+        for i in range(5_000):
+            state._rate_buckets[f"10.0.0.{i}"].append(now)
+            state.sweep_rate_buckets(
+                now,
+                force=len(state._rate_buckets) >= 100,
+            )
+
+        assert len(state._rate_buckets) <= 100
+
+    def test_idle_buckets_are_reclaimed(self, override_settings):
+        """A caller that never returns must not hold memory forever."""
+        from src.translation.llm_decoder import state
+
+        state._rate_buckets.clear()
+        state._last_sweep = 0.0
+
+        now = time.monotonic()
+        state._rate_buckets["stale-caller"].append(now - 3600.0)
+        state._rate_buckets["live-caller"].append(now)
+
+        state.sweep_rate_buckets(now, force=True)
+
+        assert "stale-caller" not in state._rate_buckets
+        assert "live-caller" in state._rate_buckets
         assert codes.count(200) <= 5

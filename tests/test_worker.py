@@ -154,9 +154,11 @@ class TestDegradedArray:
         for step in range(5):
             assembler.push(_window(0, 260.0 + step))
 
-        # The stale window is gone rather than blocking forever.
-        assert 1 not in assembler._windows
+        # The stale window is dropped rather than blocking forever, so the
+        # surviving microphone can still produce a snapshot.
         assert assembler.is_complete(now=time.monotonic() + 5.0)
+        assert 1 not in assembler._windows
+        assert set(assembler.assemble()[2]) == {0}
 
     def test_below_quorum_emits_nothing(self):
         """A graph too sparse to convolve is worse than no answer."""
@@ -315,15 +317,20 @@ class TestInferenceWorker:
         forecasts = {p["ttf_prediction"] for p in payloads}
         assert len(forecasts) > 1, "forecasts must not be one pooled number copied N times"
 
-    def test_degraded_array_still_emits_telemetry(self, worker, override_settings):
-        """End to end: a dead microphone must not stop the other three."""
-        override_settings(ARRAY_MAX_WAIT=0.0, ARRAY_MIN_NODES=2)
+    def test_degraded_array_still_emits_telemetry(self, worker):
+        """
+        End to end: a dead microphone must not stop the other three.
+
+        ``max_wait=0`` releases as soon as the quorum is met, which keeps the
+        test deterministic without sleeping; the quorum is set to N-1 so the
+        snapshot fires on exactly the three surviving microphones.
+        """
         worker.assembler = WindowAssembler(
             num_nodes=settings.NUM_NODES,
             seq_length=8,
             n_mels=settings.N_MELS,
             max_wait=0.0,
-            min_nodes=2,
+            min_nodes=settings.NUM_NODES - 1,
         )
 
         now = time.time()
