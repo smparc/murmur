@@ -10,6 +10,47 @@ from src.ingestion.mock_edge_device import FaultType, generate_mock_audio
 from src.settings import settings
 
 
+class _RecordingProducer:
+    """Captures the topics a publish call actually writes to."""
+
+    def __init__(self) -> None:
+        self.topics: list[str] = []
+
+    def produce(self, topic, key=None, value=None, callback=None) -> None:
+        self.topics.append(topic)
+
+
+class TestFrameTopicIsOptIn:
+    """
+    ``PROCESSED_TOPIC`` had no consumer anywhere in the tree — the worker reads
+    ``WINDOWED_TOPIC``. Every frame from every node was still serialized,
+    compressed and shipped to the broker, and retained, for no reader.
+    """
+
+    def _publish_once(self, buffer_len: int = 1):
+        from src.ingestion.cuda_stream_processor import SlidingWindowBuffer, _publish
+
+        producer = _RecordingProducer()
+        buffer = SlidingWindowBuffer(window_size=buffer_len, num_nodes=settings.NUM_NODES)
+        spec = np.zeros((settings.N_MELS, settings.MEL_FRAMES_PER_CHUNK), dtype=np.float32)
+        _publish(producer, buffer, node_id=0, timestamp=1.0, spec=spec)
+        return producer.topics
+
+    def test_frame_topic_is_silent_by_default(self, override_settings):
+        override_settings(PUBLISH_FRAME_TOPIC=False)
+        topics = self._publish_once()
+        assert settings.PROCESSED_TOPIC not in topics
+
+    def test_windowed_topic_is_always_published(self, override_settings):
+        """The worker depends on this one; it must never become optional."""
+        override_settings(PUBLISH_FRAME_TOPIC=False)
+        assert settings.WINDOWED_TOPIC in self._publish_once()
+
+    def test_frame_topic_returns_when_asked_for(self, override_settings):
+        override_settings(PUBLISH_FRAME_TOPIC=True)
+        assert settings.PROCESSED_TOPIC in self._publish_once()
+
+
 class TestMockAudioGeneration:
     """
     The previous version of this module called

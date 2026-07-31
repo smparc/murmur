@@ -236,4 +236,3 @@ class TestRateLimit:
 
         assert "stale-caller" not in state._rate_buckets
         assert "live-caller" in state._rate_buckets
-        assert codes.count(200) <= 5

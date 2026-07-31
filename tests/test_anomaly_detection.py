@@ -2,7 +2,50 @@
 
 import torch
 
-from src.detection.anomaly_detector import AnomalyScorer, SpectrogramAutoencoder
+from src.detection.anomaly_detector import _DEGENERATE_Z, AnomalyScorer, SpectrogramAutoencoder
+
+
+class TestDegenerateBaseline:
+    """
+    A constant baseline has no scale, so the *magnitude* of a departure from it
+    is not meaningful. The previous code multiplied the relative change by 1e3,
+    producing z-scores in the tens of thousands that were written straight to a
+    Prometheus gauge and interpolated into an LLM prompt.
+    """
+
+    def test_z_score_saturates_instead_of_exploding(self):
+        scorer = AnomalyScorer(autoencoder=None, num_nodes=1, warmup_frames=1, window=50)
+
+        constant = torch.full((64, 8), 0.001)
+        for _ in range(10):
+            scorer.score(0, constant)
+
+        result = scorer.score(0, torch.full((64, 8), 5.0))
+
+        assert result.z_score == _DEGENERATE_Z
+        assert result.is_anomaly is True
+        assert result.severity == "critical"
+
+    def test_a_quieter_channel_is_not_a_fault(self):
+        """Sign is preserved: silence is not a bearing failure."""
+        scorer = AnomalyScorer(autoencoder=None, num_nodes=1, warmup_frames=1, window=50)
+
+        constant = torch.full((64, 8), 1.0)
+        for _ in range(10):
+            scorer.score(0, constant)
+
+        result = scorer.score(0, torch.zeros(64, 8))
+
+        assert result.z_score == -_DEGENERATE_Z
+        assert result.is_anomaly is False
+
+    def test_an_identical_frame_scores_zero(self):
+        scorer = AnomalyScorer(autoencoder=None, num_nodes=1, warmup_frames=1, window=50)
+        constant = torch.full((64, 8), 0.25)
+        for _ in range(10):
+            scorer.score(0, constant)
+
+        assert scorer.score(0, constant).z_score == 0.0
 
 
 class TestSpectrogramAutoencoder:
