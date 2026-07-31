@@ -1,36 +1,71 @@
 """Shared pytest fixtures for the Murmur test suite."""
 
+from __future__ import annotations
 
-import pytest
-import torch
-import numpy as np
+import os
 
+# Set before any src import: the telemetry service reads this at startup, and
+# without it the API tests would try to download a multi-gigabyte model from
+# HuggingFace on every run.
+os.environ.setdefault("LLM_ENABLED", "false")
+os.environ.setdefault("MURMUR_API_KEY", "")
+
+import numpy as np  # noqa: E402
+import pytest  # noqa: E402
+import torch  # noqa: E402
+
+SEED = 1337
+
+
+@pytest.fixture(autouse=True)
+def _deterministic():
+    """
+    Reseed every RNG before each test.
+
+    Several assertions in this suite are statistical (does anomalous data score
+    higher, does a split actually shuffle). Unseeded, they fail a few runs in a
+    hundred and get dismissed as flakes.
+    """
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
 
 @pytest.fixture
-def device():
+def device() -> torch.device:
     return torch.device("cpu")
 
 
-
 @pytest.fixture
-def sample_edge_topology():
-    """4-node fully-connected acoustic topology."""
-    from src.mapping.topology_graph import build_acoustic_topology
-
-
-    mics = [
+def mic_coords() -> list[tuple[float, float, float]]:
+    return [
         (0.0, 0.0, 3.0),
         (5.0, 0.0, 3.0),
         (0.0, 10.0, 3.0),
         (5.0, 10.0, 3.0),
     ]
-    edge_index, edge_weight = build_acoustic_topology(mics)
-    return edge_index, edge_weight, len(mics)
-
 
 
 @pytest.fixture
-def mock_audio_chunk():
-    """Half-second float32 audio waveform at 16 kHz."""
+def sample_edge_topology(mic_coords):
+    """4-node acoustic topology: ``(edge_index, edge_weight, num_nodes)``."""
+    from src.mapping.topology_graph import build_acoustic_topology
+
+    edge_index, edge_weight = build_acoustic_topology(mic_coords)
+    return edge_index, edge_weight, len(mic_coords)
+
+
+@pytest.fixture
+def mock_audio_chunk() -> np.ndarray:
+    """Half-second float32 waveform at 16 kHz."""
     return np.random.randn(8000).astype(np.float32)
+
+
+@pytest.fixture
+def api_client():
+    """TestClient with the lifespan run, so models are actually initialised."""
+    from fastapi.testclient import TestClient
+
+    from src.translation.llm_decoder import app
+
+    with TestClient(app) as client:
+        yield client
