@@ -108,6 +108,13 @@ class Settings:
         default_factory=lambda: _env_str("WORKER_GROUP_ID", "inference-worker-group")
     )
     KAFKA_COMPRESSION: str = field(default_factory=lambda: _env_str("KAFKA_COMPRESSION", "lz4"))
+    # The per-frame topic exists for external consumers; nothing inside Murmur
+    # reads it (the worker consumes WINDOWED_TOPIC). Publishing it by default
+    # costs a serialize + compress + broker round trip per frame per node for
+    # nobody, so it is opt-in.
+    PUBLISH_FRAME_TOPIC: bool = field(
+        default_factory=lambda: _env_bool("PUBLISH_FRAME_TOPIC", False)
+    )
 
     # -- Audio --
     SAMPLE_RATE: int = field(default_factory=lambda: _env_int("SAMPLE_RATE", 16_000))
@@ -133,6 +140,23 @@ class Settings:
         default_factory=lambda: _env_int("ANOMALY_WARMUP_FRAMES", 50)
     )
     ANOMALY_WINDOW: int = field(default_factory=lambda: _env_int("ANOMALY_WINDOW", 500))
+
+    # -- Array liveness --
+    # A graph snapshot ideally contains every microphone. But requiring all of
+    # them unconditionally means one dead sensor silences the entire array —
+    # the system goes quiet, which on a monitoring product is indistinguishable
+    # from "nothing is wrong". These three settings bound that failure.
+    #
+    # Spread across one snapshot still treated as a single acoustic instant.
+    WINDOW_STALENESS_TOLERANCE: float = field(
+        default_factory=lambda: _env_float("WINDOW_STALENESS_TOLERANCE", 5.0)
+    )
+    # How long to wait for absent microphones before releasing a partial
+    # snapshot. Must exceed normal jitter or healthy arrays degrade needlessly.
+    ARRAY_MAX_WAIT: float = field(default_factory=lambda: _env_float("ARRAY_MAX_WAIT", 15.0))
+    # Below this many reporting microphones the graph is too sparse to convolve
+    # meaningfully, so nothing is emitted and the operator is told why.
+    ARRAY_MIN_NODES: int = field(default_factory=lambda: _env_int("ARRAY_MIN_NODES", 2))
 
     # -- LLM --
     LLM_MODEL_NAME: str = field(
@@ -180,6 +204,19 @@ class Settings:
     # headroom for bursts and backfill. Set 0 to disable.
     RATE_LIMIT_PER_MINUTE: int = field(
         default_factory=lambda: _env_int("RATE_LIMIT_PER_MINUTE", 1200)
+    )
+    # The limiter keeps one bucket per caller identity. On a public endpoint an
+    # attacker controls that identity, so an unbounded map of buckets turns the
+    # anti-DoS control into a memory-exhaustion vector of its own. Idle buckets
+    # are swept; this caps what survives a burst of distinct keys.
+    RATE_LIMIT_MAX_KEYS: int = field(
+        default_factory=lambda: _env_int("RATE_LIMIT_MAX_KEYS", 10_000)
+    )
+    # /metrics publishes per-node anomaly counts and z-scores — an operational
+    # map of which machines are failing. Authenticated by default whenever a key
+    # is configured; set false for an in-cluster Prometheus that cannot send one.
+    METRICS_REQUIRE_AUTH: bool = field(
+        default_factory=lambda: _env_bool("METRICS_REQUIRE_AUTH", True)
     )
 
     # -- Topology --
@@ -285,6 +322,26 @@ class Settings:
                 f"GNN_HIDDEN_CHANNELS ({self.GNN_HIDDEN_CHANNELS}) must be divisible by "
                 f"GNN_NUM_HEADS ({self.GNN_NUM_HEADS}) for multi-head attention"
             )
+
+        if self.WINDOW_STALENESS_TOLERANCE <= 0:
+            errors.append(
+                f"WINDOW_STALENESS_TOLERANCE must be > 0, got {self.WINDOW_STALENESS_TOLERANCE}"
+            )
+        if self.ARRAY_MAX_WAIT < self.WINDOW_STALENESS_TOLERANCE:
+            errors.append(
+                f"ARRAY_MAX_WAIT ({self.ARRAY_MAX_WAIT}) must be >= "
+                f"WINDOW_STALENESS_TOLERANCE ({self.WINDOW_STALENESS_TOLERANCE}); a shorter "
+                "wait would release degraded snapshots before a healthy array can converge"
+            )
+        if self.ARRAY_MIN_NODES < 1:
+            errors.append(f"ARRAY_MIN_NODES must be >= 1, got {self.ARRAY_MIN_NODES}")
+        if self.ARRAY_MIN_NODES > len(self.MIC_COORDS):
+            errors.append(
+                f"ARRAY_MIN_NODES ({self.ARRAY_MIN_NODES}) exceeds the number of "
+                f"microphones ({len(self.MIC_COORDS)}); no snapshot could ever be released"
+            )
+        if self.RATE_LIMIT_MAX_KEYS <= 0:
+            errors.append(f"RATE_LIMIT_MAX_KEYS must be > 0, got {self.RATE_LIMIT_MAX_KEYS}")
 
         if self.ANOMALY_WINDOW < self.ANOMALY_WARMUP_FRAMES:
             errors.append(
