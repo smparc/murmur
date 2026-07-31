@@ -547,19 +547,33 @@ class InferenceWorker:
             return False
 
     def handle_window(self, window: NodeWindow) -> list[dict]:
-        """Buffer a window and, once the array is complete, infer and submit."""
-        self.assembler.push(window)
+        """Buffer a window and, once the array is ready, infer and submit."""
+        if not self.assembler.push(window):
+            return []
         if not self.assembler.is_complete():
             return []
 
         x, timespans, snapshot = self.assembler.assemble()
+        missing = set(self.assembler.last_missing)
         self.assembler.clear()
+
+        ARRAY_NODES_REPORTING.set(len(snapshot))
+        SNAPSHOTS_EMITTED.labels(mode="degraded" if missing else "complete").inc()
+        if missing:
+            log.warning(
+                "Emitting a degraded snapshot: %d/%d microphones reporting (missing %s). "
+                "Spatial inference is running over a graph with holes in it.",
+                len(snapshot),
+                self.assembler.num_nodes,
+                sorted(missing),
+            )
 
         with track_stage("inference"):
             payloads = self.infer(x, timespans, snapshot)
 
         for payload in payloads:
-            self.submit(payload)
+            if not self.submit(payload):
+                TELEMETRY_DROPPED.labels(node_id=str(payload["node_id"])).inc()
         return payloads
 
     def close(self) -> None:
