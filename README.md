@@ -1,323 +1,267 @@
 # Murmur
-[![CI](https://github.com/smparc/murmur/actions/workflows/ci.yml/badge.svg)](https://github.com/smparc/murmur/actions)
+
+[![CI](https://github.com/smparc/murmur/actions/workflows/ci.yml/badge.svg)](https://github.com/smparc/murmur/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)]()
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Docker Ready](https://img.shields.io/badge/docker-ready-blue.svg)]()
 [![Kubernetes](https://img.shields.io/badge/kubernetes-production-326ce5.svg)]()
-[![Next.js](https://img.shields.io/badge/Next.js-Dashboard-black?logo=next.js)]()
 
-
-**Murmur** is an enterprise-grade, spatio-temporal acoustic monitoring system. It turns ambient mechanical noise into a predictive maintenance engine. By ingesting continuous, multi-channel audio feeds from a sparse grid of microphones, Murmur localizes anomalous sounds, translates them into human-readable telemetry using an Audio LLM, and dynamically forecasts cascading equipment failures using Liquid Neural Networks (LNNs). 
-
-
-Designed to be shipped to production environments rather than existing as a local proof of concept, the system leverages high-performance GPU compute, containerized orchestration, continuous CI/CD, and a real-time React dashboard to handle massive audio streams in real time.
-
+**Murmur** is a spatio-temporal acoustic monitoring system. It turns ambient
+mechanical noise into a predictive maintenance signal: continuous multi-channel
+audio from a sparse microphone grid is localised across a graph of the facility,
+scored for anomalies against each sensor's own baseline, projected forward into
+a Time-to-Failure estimate by a continuous-time network, and rendered as
+human-readable telemetry on a live dashboard.
 
 ---
-
 
 ## System Architecture
 
-
-The following diagram illustrates the continuous data flow from physical audio capture to predictive text telemetry.
-
-
 ```mermaid
 graph TD
-    subgraph Edge / Factory Floor
-        M1((Mic 1)) --> |Raw Audio| K[Apache Kafka Stream]
-        M2((Mic 2)) --> |Raw Audio| K
-        Sim[Mock Edge Simulator] -.-> K
-    end
+    subgraph Edge["Edge / Factory Floor"]
+        M1((Mic 1)) -->|Raw Audio| K[Apache Kafka]
+        M2((Mic 2)) -->|Raw Audio| K
+        Sim[Mock Edge Simulator] -.-> K
+    end
 
+    subgraph Ingest["GPU Ingestion"]
+        K --> C[Batched log-mel on GPU]
+        C --> W[Per-node sliding window]
+        W -->|spectrogram-embeddings-windowed| KT[(Kafka)]
+    end
 
-    subgraph GPU Accelerated Ingestion
-        K --> C{CUDA / cuDF Preprocessing}
-        C --> |Mel-Spectrograms| ST[Spatio-Temporal GNN]
-    end
+    subgraph Worker["Inference Worker"]
+        KT --> A[Assemble full array snapshot]
+        A --> ST[ST-GNN → embedding sequence]
+        ST --> LNN[Liquid Network → TTF]
+        A --> AD[Autoencoder + robust z-score]
+        LNN --> POST[POST /generate_telemetry]
+        AD --> POST
+    end
 
+    subgraph Serve["Telemetry API"]
+        POST --> LLM[Projector + Audio LLM]
+        LLM --> WS[WebSocket broadcast]
+        LLM --> PM[/metrics/]
+    end
 
-    subgraph Production Inference Cluster
-        ST --> |Spatial/Temporal Embeddings| LLM[Audio LLM via vLLM/FastAPI]
-        ST --> |Continuous Acoustic Data| LNN[Liquid Neural Network]
-    end
+    WS --> UI([Next.js Dashboard])
 
-
-    subgraph MLOps & Orchestration
-        Dagster[Dagster Data Lineage] -.-> |Monitors| K
-        Train[Training Pipeline] --> |Saves .pth| ST
-        Train --> |Saves .pth| LNN
-        Train -.-> |Logs Metrics| MLflow[MLflow Model Registry]
-    end
-
-
-    subgraph Output Routing
-        LLM --> |Autoregressive Text Logs| UI([Next.js React Dashboard])
-        LNN --> |Dynamic TTF Forecasts| UI
-    end
+    subgraph Ops["MLOps"]
+        Dagster[Dagster assets] -.->|drift checks| KT
+        Train[Training pipeline] -->|.pth| ST
+        Train -->|.pth| LNN
+        Train -->|.pth| AD
+        Train -.-> MLflow[MLflow]
+    end
 ```
 
+The **inference worker** is the piece that makes this a system rather than a
+collection of services: it consumes spectrogram windows, assembles a coherent
+snapshot across the whole microphone array, runs the model chain, and submits
+scored telemetry to the API.
 
 ---
-
 
 ## Technology Stack
 
-
 | Component | Technology | Purpose in Production |
 | :--- | :--- | :--- |
-| **Data Ingestion** | Apache Kafka | Handles continuous, high-throughput raw audio streams without packet loss. |
-| **Serialization** | MessagePack | Binary-encoded tensor transport — 10-50x faster than JSON for spectrogram payloads. |
-| **Preprocessing** | Custom CUDA / torchaudio | Bypasses CPU bottlenecks; extracts high-dimensional mel-spectrograms directly on the GPU. |
-| **Feature Extraction** | ST-GNN (PyTorch Geometric) | Models the physical facility as a topological graph with temporal attention + spatial GCN layers. |
-| **Telemetry Translation**| Multimodal Audio LLM | Acts as an autoregressive decoder, streaming text logs of physical anomalies (e.g., *"Impeller cavitation detected"*). |
-| **Model Serving** | FastAPI + WebSocket | Exposes the LLM via REST and real-time WebSocket for the dashboard, with health probes for K8s. |
-| **Failure Prediction** | Liquid Neural Networks | Adapts to drifting degradation patterns continuously via ODEs to forecast Time-to-Failure (TTF). |
-| **Anomaly Detection** | Convolutional Autoencoder + Adaptive Scorer | Unsupervised baseline learns "normal" acoustic patterns; online z-score thresholding per node. |
-| **Configuration** | Centralized Settings | All settings driven by environment variables with typed defaults in `src/settings.py`. |
-| **Observability** | Prometheus + MLflow | `/metrics` endpoint exports latency, throughput, anomaly counts, TTF predictions. |
-| **Orchestration & Ops** | Dagster & MLflow | Tracks data lineage, pipeline health, and model drift over time. |
-| **Deployment** | Docker & Kubernetes | Containerized microservices with health probes and HPA auto-scaling on acoustic energy spikes. |
-| **CI/CD** | GitHub Actions | Automated linting, testing, Docker builds, and K8s deployment on push to main. |
-| **Frontend** | React, Next.js, Recharts | Real-time WebSocket-connected dashboard with TTF forecasting chart and LLM diagnostic logs. |
-| **Testing** | pytest | Unit tests for all models, anomaly detection, sliding window, training pipeline + integration tests. |
-
+| **Data Ingestion** | Apache Kafka | High-throughput audio transport with at-least-once delivery and manual offset commits. |
+| **Serialization** | MessagePack | Binary tensor transport, far cheaper than JSON for spectrogram payloads. |
+| **Preprocessing** | torchaudio on CUDA | Batched log-mel spectrograms; chunks are fused into one GPU call rather than processed individually. |
+| **Feature Extraction** | ST-GNN (PyTorch Geometric) | Temporal self-attention with positional encoding, then spatial GCN over a distance-weighted graph. |
+| **Anomaly Detection** | Conv autoencoder + robust scorer | Unsupervised baseline; per-node median/MAD z-scoring adapts to sensor-specific noise floors. |
+| **Failure Prediction** | Liquid Neural Network (CfC) | Continuous-time forecasting over genuinely irregular inter-frame intervals. |
+| **Telemetry Translation** | Multimodal Audio LLM | Autoregressive diagnostics from a trained projection adapter; degrades to templated text when no LLM is resident. |
+| **Model Serving** | FastAPI + WebSocket | REST, live WebSocket feed, API-key auth, rate limiting, split liveness/readiness probes. |
+| **Configuration** | Validated settings | Environment-driven and validated at import, including the microphone layout. |
+| **Observability** | Prometheus + MLflow | Latency, throughput, anomaly counts, TTF, consumer lag, end-to-end frame age. |
+| **Orchestration** | Dagster | Topology validation, detector health, drift evaluation against a baseline. |
+| **Deployment** | Docker & Kubernetes | Non-root images, resource limits, PDB, GPU-aware and lag-driven autoscaling. |
+| **CI/CD** | GitHub Actions | Lint, format, tests on 3 Python versions, Kafka integration, frontend build, manifest validation, image publish. |
+| **Frontend** | React, Next.js, Recharts | Per-node forecast series, exponential-backoff reconnect, staleness indicators. |
+| **Testing** | pytest | 123 tests across models, detection, ingestion, worker, API, auth and configuration. |
 
 ---
-
 
 ## Repository Structure
 
-
 ```text
 murmur/
-├── .github/
-│   └── workflows/
-│       └── ci.yml                     # CI/CD: lint, test, Docker build, K8s deploy
+├── .github/workflows/ci.yml           # Lint, test, integration, frontend, images, manifests
 ├── deploy/
-│   ├── Dockerfile.ingest              # Container for CUDA audio preprocessing
-│   ├── Dockerfile.inference           # Container for ST-GNN, LNN, and LLM serving
-│   └── k8s/
-│       ├── 01-kafka-cluster.yaml      # Kafka KRaft mode StatefulSet
-│       ├── 02-ingest-deployment.yaml  # GPU-accelerated ingestion pods
-│       ├── 03-inference-deployment.yaml # Load-balanced inference with health probes
-│       └── 04-autoscaling-hpa.yaml    # Horizontal Pod Autoscaling rules
-├── frontend/
-│   ├── package.json                   # Next.js + TypeScript dependencies
-│   └── app/
-│       └── page.tsx                   # Live React dashboard (WebSocket-connected)
-├── orchestration/
-│   ├── __init__.py
-│   └── data_pipeline.py              # Dagster assets and drift monitoring schedules
+│   ├── Dockerfile.ingest              # CUDA ingestion image
+│   ├── Dockerfile.inference           # API + worker image
+│   └── k8s/                           # Namespace, Kafka, deployments, HPAs, PDB
+├── frontend/                          # Next.js dashboard (App Router + Tailwind)
+├── orchestration/data_pipeline.py     # Dagster assets and drift schedule
 ├── src/
-│   ├── __init__.py
-│   ├── settings.py                    # Centralized env-var-driven configuration
-│   ├── detection/
-│   │   ├── __init__.py
-│   │   └── anomaly_detector.py        # Autoencoder + online adaptive scorer
-│   ├── ingestion/
-│   │   ├── __init__.py
-│   │   ├── cuda_stream_processor.py   # Kafka → GPU spectrogram → sliding window → publish
-│   │   ├── mock_edge_device.py        # Stochastic multi-fault factory simulator
-│   │   └── stft_kernels.cu            # Custom C++ CUDA kernels (Pre-emphasis & Hann)
-│   ├── mapping/
-│   │   ├── __init__.py
-│   │   ├── st_gnn_model.py            # Spatio-Temporal GNN (Temporal Attention + Spatial GCN)
-│   │   └── topology_graph.py          # Physical room geometry configuration
-│   ├── observability/
-│   │   ├── __init__.py
-│   │   └── metrics.py                 # Prometheus metrics (latency, anomalies, TTF)
-│   ├── translation/
-│   │   ├── __init__.py
-│   │   └── llm_decoder.py             # FastAPI + WebSocket + Prometheus inference service
-│   ├── forecasting/
-│   │   ├── __init__.py
-│   │   └── liquid_network.py          # Continuous-time Closed-form Network (CfC)
-│   └── training/
-│       └── train_pipeline.py          # Train/val/test split, degradation data, early stopping
-├── tests/
-│   ├── conftest.py                    # Shared pytest fixtures
-│   ├── test_models.py                 # ST-GNN + topology unit tests
-│   ├── test_forecasting.py            # LNN unit tests
-│   ├── test_ingestion.py              # Audio generation + MessagePack tests
-│   ├── test_anomaly_detection.py      # Autoencoder + scorer tests
-│   ├── test_sliding_window.py         # Buffer + data quality tests
-│   ├── test_training_pipeline.py      # Data gen, splitting, metrics tests
-│   ├── test_api.py                    # FastAPI endpoint tests
-│   ├── test_settings.py               # Configuration validation tests
-│   └── test_integration.py            # Kafka roundtrip integration test
-├── docker-compose.kafka.yml           # Local Kafka broker for development
-├── pyproject.toml                     # Package metadata, ruff, pytest config
-├── requirements.txt                   # Python dependencies (CUDA 12.x target)
-├── .gitignore
-└── README.md
+│   ├── settings.py                    # Validated env-driven configuration
+│   ├── detection/anomaly_detector.py  # Autoencoder + online robust scorer
+│   ├── forecasting/liquid_network.py  # Closed-form Continuous-time network
+│   ├── inference/worker.py            # Windows → models → telemetry
+│   ├── ingestion/
+│   │   ├── cuda_stream_processor.py   # Kafka → batched GPU log-mel → windows
+│   │   ├── mock_edge_device.py        # Multi-fault factory simulator
+│   │   └── stft_kernels.cu            # Reference CUDA kernels (not on the hot path)
+│   ├── mapping/
+│   │   ├── st_gnn_model.py            # Temporal attention + spatial GCN
+│   │   └── topology_graph.py          # Distance-weighted acoustic graph
+│   ├── observability/metrics.py       # Prometheus metrics
+│   ├── training/train_pipeline.py     # Three-stage training
+│   └── translation/llm_decoder.py     # FastAPI + WebSocket telemetry service
+└── tests/                             # 123 unit + integration tests
 ```
 
-
 ---
 
-
-## Execution Pipeline
-
-
-The project execution is divided into distinct phases to ensure scalability and fault tolerance.
-
-
-| Phase | Description | Key Deliverables |
-| :--- | :--- | :--- |
-| **1. Ingestion** | Raw audio is captured and piped into Kafka topics. Custom CUDA kernels process the waveform into spectrograms on the fly. | Multi-channel streaming pipeline, CUDA preprocessing module. |
-| **2. Mapping** | The facility's geometry is mapped into an ST-GNN. The model learns spatial dependencies (machine distances) and temporal acoustic patterns. | Trained ST-GNN, topological acoustic embeddings. |
-| **3. Translation**| The ST-GNN embeddings trigger the Audio LLM inference engine. The LLM processes the embeddings to generate human-readable diagnostics. | vLLM serving endpoint, streaming text telemetry logs. |
-| **4. Forecasting**| The Liquid Neural Network ingests the continuous streams. Its internal equations adapt in real time to shifting acoustic profiles. | Dynamic TTF (Time-to-Failure) probability metrics. |
-| **5. Operations**| Dagster and MLflow monitor the data streams and track the drift of the LNN predictions over time. | Validated data lineage and retrain triggers. |
-| **6. Deployment** | All microservices are containerized. Kubernetes handles horizontal pod autoscaling (HPA) during loud acoustic anomaly events. | Dockerfiles, K8s deployment manifests, CI/CD, active cluster. |
-
-
----
-
-
-## ⚙️ Getting Started
-
+## Getting Started
 
 ### Prerequisites
-*   NVIDIA GPU (CUDA 12.x compatible)
-*   Windows Subsystem for Linux (WSL2) with Hardware Virtualization enabled (if on Windows)
-*   Docker & Docker Compose
-*   Kubernetes (Minikube/Kind for local, managed K8s for production)
-*   Node.js v18+
 
+- Python 3.10–3.12
+- Docker & Docker Compose
+- Node.js 18+ (dashboard)
+- NVIDIA GPU with CUDA 12.x — optional; everything runs on CPU
 
-### Installation & Local Simulation
+### Installation
 
-
-**1. Clone the repository**
 ```bash
-git clone [https://github.com/smparc/murmur.git](https://github.com/smparc/murmur.git)
+git clone https://github.com/smparc/murmur.git
 cd murmur
+
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+
+# CPU wheels; omit for the default CUDA build
+pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+pip install -e ".[dev]"
 ```
 
+### Running the pipeline
 
-**2. Spin up the Kafka Event Stream**
 ```bash
-docker-compose -f docker-compose.kafka.yml up -d
-```
+# 1. Broker
+docker compose -f docker-compose.kafka.yml up -d
 
+# 2. Train (writes models/*.pth)
+murmur-train
 
-**3. Train the Models (Initialize Weights)**
-```bash
-python3 src/training/train_pipeline.py
-```
-
-
-**4. Boot the Streaming Pipeline (Requires 3 Terminals)**
-```bash
-# Terminal 1: Start the CUDA Preprocessor
-python3 src/ingestion/cuda_stream_processor.py
-
-
-# Terminal 2: Start the LLM Telemetry Server
+# 3. Four processes
+murmur-simulate    # edge microphones      → raw-audio-stream
+murmur-ingest      # GPU preprocessing     → spectrogram-embeddings-windowed
+murmur-worker      # models + scoring      → POST /generate_telemetry
 uvicorn src.translation.llm_decoder:app --host 0.0.0.0 --port 8000
 
-
-# Terminal 3: Simulate the Edge Microphones
-python3 src/ingestion/mock_edge_device.py
+# 4. Dashboard
+cd frontend && npm install && npm run dev
 ```
 
+Then open <http://localhost:3000>.
 
-**5. Launch the Live Dashboard**
-```bash
-cd frontend
-npm install
-npm run dev
-```
-Navigate to `http://localhost:3000` to view the telemetry.
+To skip the multi-gigabyte model download during development, set
+`LLM_ENABLED=false`. The service still emits full structured telemetry — anomaly
+score, severity, TTF — with the narrative field templated. Responses carry a
+`generated` flag so the dashboard can label templated text as such.
 
+### Production deployment
 
-### Production Deployment
-
-
-**1. Build the Preprocessing and Inference Containers**
 ```bash
 docker build -t murmur-ingest:latest -f deploy/Dockerfile.ingest .
 docker build -t murmur-inference:latest -f deploy/Dockerfile.inference .
-```
 
-
-**2. Deploy to Kubernetes**
-```bash
+# Set a real API key first — an empty key disables authentication
 kubectl apply -f deploy/k8s/
+kubectl get pods -n murmur -o wide
 ```
-
-
-**3. Verify Pod Health**
-Ensure all services (Kafka brokers, ST-GNN extractors, and LLM serving engines) are running:
-```bash
-kubectl get pods -o wide
-kubectl get hpa murmur-inference-hpa
-```
-
 
 ---
 
+## Configuration
 
-## Environment Configuration
-
-
-All settings are driven by environment variables with sensible defaults. See [`src/settings.py`](src/settings.py) for the full list.
-
+All settings are environment variables, validated at import. See
+[`src/settings.py`](src/settings.py).
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `KAFKA_BROKER` | `localhost:9092` | Kafka broker connection string |
-| `LLM_MODEL_NAME` | `Qwen/Qwen1.5-1.8B` | HuggingFace model ID for telemetry generation |
-| `GNN_EMBEDDING_DIM` | `256` | ST-GNN output embedding dimension |
-| `MLFLOW_TRACKING_URI` | `http://localhost:5000` | MLflow tracking server URL |
-| `INFERENCE_PORT` | `8000` | FastAPI server port |
-| `SAMPLE_RATE` | `16000` | Audio sample rate (Hz) |
+| `KAFKA_BROKER` | `localhost:9092` | Broker connection string |
+| `MIC_COORDS` | 4-mic default | Microphone layout as JSON `[[x,y,z], ...]`, in metres |
+| `DISTANCE_THRESHOLD` | `15.0` | Maximum acoustic coupling distance (m) |
+| `SAMPLE_RATE` / `N_FFT` / `HOP_LENGTH` / `N_MELS` | `16000` / `1024` / `512` / `64` | STFT parameters |
+| `SEQ_LENGTH` | `50` | Frames per temporal window |
+| `GNN_EMBEDDING_DIM` | `256` | ST-GNN output dimension |
+| `ANOMALY_Z_THRESHOLD` | `3.0` | Robust-z above which a frame is flagged |
+| `LLM_MODEL_NAME` | `Qwen/Qwen1.5-1.8B` | HuggingFace model ID |
+| `LLM_ENABLED` | `true` | Set `false` to serve templated telemetry |
+| `MURMUR_API_KEY` | *(empty)* | Enables `X-API-Key` auth when set |
+| `RATE_LIMIT_PER_MINUTE` | `1200` | Must exceed `NUM_NODES` per `CHUNK_DURATION` |
+| `MODEL_DIR` | `models` | Where weights are read and written |
+| `SEED` | `1337` | Seeds every RNG for reproducible training |
 
+Invalid combinations are rejected at startup with a message naming each problem,
+rather than producing silently misshapen tensors downstream.
 
 ---
-
 
 ## Testing
 
-
 ```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-
-# Run unit tests
-pytest tests/ -v --ignore=tests/test_integration.py
-
-
-# Run with coverage
-pytest tests/ --cov=src --cov-report=term-missing --ignore=tests/test_integration.py
-
-
-# Run integration tests (requires Kafka running)
-docker-compose -f docker-compose.kafka.yml up -d
-pytest tests/test_integration.py -v
+pytest tests/ -m "not integration"                    # unit
+pytest tests/ --cov=src --cov-report=term-missing     # with coverage
+docker compose -f docker-compose.kafka.yml up -d
+pytest tests/ -m integration                          # needs a broker
 ```
-
 
 ---
 
+## Architecture Notes
 
-## Architecture Details
+### ST-GNN
 
+1. **Input projection + sinusoidal positional encoding.** Self-attention is
+   permutation-invariant; without positional information a model whose purpose
+   is detecting temporal signatures would return an identical embedding for
+   time-reversed input.
+2. **Temporal attention**, applied per node so each microphone attends over its
+   own history without leaking across the array.
+3. **Spatial GCN** at every timestep, over `batch × seq` disjoint copies of the
+   topology convolved in a single call.
+4. **Readout** to either a pooled `(B, E)` embedding or a full `(B, S, E)`
+   sequence.
 
-### ST-GNN (Spatio-Temporal Graph Neural Network)
+The sequence output matters: a continuous-time forecaster fed one pooled vector
+broadcast across time receives a constant, which defeats the reason to use one.
 
+### Anomaly scoring
 
-The ST-GNN models the factory floor as a topological graph:
+Reconstruction error is not comparable across microphones — a sensor above a
+compressor sits at a completely different noise floor than one in a corridor.
+Each node is therefore judged against a bounded rolling window of its own recent
+history, using a median/MAD robust z-score. Median over mean is deliberate: a
+developing fault contaminates the very statistics used to detect it, and the
+mean is far more easily dragged along.
 
+### Liquid Network
 
-1. **Temporal Attention** — Multi-head self-attention over each node's spectrogram sequence to capture frequency drift and transient impulses
-2. **Spatial GCN** — Graph convolutional layers propagate acoustic correlations across physically connected microphone nodes (inverse-distance weighted edges)
-3. **Graph Readout** — Global mean pooling + MLP projects the entire graph state into a dense embedding for downstream LLM/LNN consumption
+`ncps`' `CfC.forward` reduces each step's timespan with
+`timespans[:, t].squeeze()`, yielding a `(batch,)` vector multiplied against a
+`(batch, units)` activation — which only broadcasts when `units == batch`.
+Supplying real per-sample timings therefore raises for any batch above one.
+`src/forecasting/liquid_network.py` drives the underlying cell directly with a
+`(batch, 1)` timespan so every sample integrates over its own interval.
 
+### WebSocket feed
 
-### WebSocket Real-Time Feed
+The dashboard connects to `ws://localhost:8000/ws/telemetry` and receives
+structured frames — severity, anomaly score, robust z, TTF — alongside the
+prose. It never pattern-matches generated text, because model output is not a
+stable interface. New clients receive a short replay buffer so an operator
+opening the page mid-shift sees context rather than a blank screen; that buffer
+is cleared on restart so pre-restart frames are never presented as current.
 
+---
 
-The dashboard connects to `ws://localhost:8000/ws/telemetry` via WebSocket. Every time the LLM generates a diagnostic, it's automatically broadcast to all connected clients with structured anomaly data (severity, TTF prediction, anomaly score) — not derived from text regex. The frontend includes auto-reconnect with exponential backoff. When disconnected, a clear "Backend offline" message is shown instead of fake data, which is critical for safety-critical monitoring systems.
+## License
+
+[MIT](LICENSE)
