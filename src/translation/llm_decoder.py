@@ -126,9 +126,7 @@ class TelemetryResponse(BaseModel):
     telemetry: str
     anomaly: AnomalyBlock
     ttf_prediction: float
-    generated: bool = Field(
-        description="True when an LLM produced the text; False when templated."
-    )
+    generated: bool = Field(description="True when an LLM produced the text; False when templated.")
 
 
 class HealthResponse(BaseModel):

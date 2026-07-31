@@ -1,6 +1,5 @@
 """Integration test for the full pipeline (requires Kafka)."""
 
-
 import time
 
 import pytest
@@ -9,18 +8,17 @@ import pytest
 pytest.importorskip("confluent_kafka")
 
 
-
 @pytest.fixture
 def kafka_available():
     """Check if Kafka broker is reachable."""
     from confluent_kafka import Producer
+
     try:
         p = Producer({"bootstrap.servers": "localhost:9092"})
         p.flush(timeout=2)
         return True
     except Exception:
         pytest.skip("Kafka broker not available")
-
 
 
 class TestKafkaPipeline:
@@ -30,29 +28,26 @@ class TestKafkaPipeline:
         import msgpack
         from confluent_kafka import Consumer, Producer
 
-
         topic = "murmur-test-roundtrip"
         test_payload = msgpack.packb({"test": True, "ts": time.time()}, use_bin_type=True)
-
 
         # Produce
         producer = Producer({"bootstrap.servers": "localhost:9092"})
         producer.produce(topic, value=test_payload)
         producer.flush(timeout=5)
 
-
         # Consume
-        consumer = Consumer({
-            "bootstrap.servers": "localhost:9092",
-            "group.id": "test-group",
-            "auto.offset.reset": "earliest",
-        })
+        consumer = Consumer(
+            {
+                "bootstrap.servers": "localhost:9092",
+                "group.id": "test-group",
+                "auto.offset.reset": "earliest",
+            }
+        )
         consumer.subscribe([topic])
-
 
         msg = consumer.poll(timeout=10)
         consumer.close()
-
 
         assert msg is not None
         assert not msg.error()

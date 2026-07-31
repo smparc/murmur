@@ -107,9 +107,7 @@ class Settings:
     WORKER_GROUP_ID: str = field(
         default_factory=lambda: _env_str("WORKER_GROUP_ID", "inference-worker-group")
     )
-    KAFKA_COMPRESSION: str = field(
-        default_factory=lambda: _env_str("KAFKA_COMPRESSION", "lz4")
-    )
+    KAFKA_COMPRESSION: str = field(default_factory=lambda: _env_str("KAFKA_COMPRESSION", "lz4"))
 
     # -- Audio --
     SAMPLE_RATE: int = field(default_factory=lambda: _env_int("SAMPLE_RATE", 16_000))
@@ -204,12 +202,25 @@ class Settings:
         errors: list[str] = []
 
         positive = [
-            "SAMPLE_RATE", "N_FFT", "HOP_LENGTH", "N_MELS", "SEQ_LENGTH",
-            "GNN_EMBEDDING_DIM", "GNN_HIDDEN_CHANNELS", "GNN_IN_CHANNELS",
-            "GNN_NUM_HEADS", "LNN_HIDDEN_NEURONS", "AE_LATENT_DIM",
-            "TRAIN_EPOCHS", "TRAIN_BATCH_SIZE", "TRAIN_NUM_SAMPLES",
-            "LLM_MAX_NEW_TOKENS", "LLM_HIDDEN_DIM", "INFERENCE_PORT",
-            "ANOMALY_WARMUP_FRAMES", "ANOMALY_WINDOW",
+            "SAMPLE_RATE",
+            "N_FFT",
+            "HOP_LENGTH",
+            "N_MELS",
+            "SEQ_LENGTH",
+            "GNN_EMBEDDING_DIM",
+            "GNN_HIDDEN_CHANNELS",
+            "GNN_IN_CHANNELS",
+            "GNN_NUM_HEADS",
+            "LNN_HIDDEN_NEURONS",
+            "AE_LATENT_DIM",
+            "TRAIN_EPOCHS",
+            "TRAIN_BATCH_SIZE",
+            "TRAIN_NUM_SAMPLES",
+            "LLM_MAX_NEW_TOKENS",
+            "LLM_HIDDEN_DIM",
+            "INFERENCE_PORT",
+            "ANOMALY_WARMUP_FRAMES",
+            "ANOMALY_WINDOW",
         ]
         for name in positive:
             if getattr(self, name) <= 0:
@@ -259,9 +270,7 @@ class Settings:
             errors.append(f"DISTANCE_THRESHOLD must be > 0, got {self.DISTANCE_THRESHOLD}")
 
         if errors:
-            raise ConfigError(
-                "Invalid Murmur configuration:\n  - " + "\n  - ".join(errors)
-            )
+            raise ConfigError("Invalid Murmur configuration:\n  - " + "\n  - ".join(errors))
 
     # -- derived values -----------------------------------------------------
 

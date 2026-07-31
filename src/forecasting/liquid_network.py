@@ -129,9 +129,7 @@ class AcousticForecastingLNN(nn.Module):
         # The final state summarises the whole observed history.
         return self.activation(self.head(liquid_out[:, -1]))
 
-    def _roll_out(
-        self, x: torch.Tensor, timespans: torch.Tensor | None
-    ) -> torch.Tensor:
+    def _roll_out(self, x: torch.Tensor, timespans: torch.Tensor | None) -> torch.Tensor:
         """
         Step the liquid cell over the sequence.
 
@@ -150,9 +148,7 @@ class AcousticForecastingLNN(nn.Module):
         batch, seq_len, _ = x.shape
         cell = self.liquid_layer.rnn_cell
 
-        state = torch.zeros(
-            batch, self.liquid_layer.state_size, device=x.device, dtype=x.dtype
-        )
+        state = torch.zeros(batch, self.liquid_layer.state_size, device=x.device, dtype=x.dtype)
         outputs = []
         for t in range(seq_len):
             step_ts: torch.Tensor | float

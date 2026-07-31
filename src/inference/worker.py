@@ -125,9 +125,9 @@ class WindowAssembler:
         x = torch.from_numpy(interleaved).float().unsqueeze(0)
         # Nodes share a clock closely enough that the mean interval is the right
         # integration step for the graph-level sequence.
-        timespans = torch.from_numpy(
-            np.mean([w.timespans for w in ordered], axis=0)
-        ).float().unsqueeze(0)
+        timespans = (
+            torch.from_numpy(np.mean([w.timespans for w in ordered], axis=0)).float().unsqueeze(0)
+        )
 
         snapshot = dict(self._windows)
         return x, timespans, snapshot
@@ -249,7 +249,8 @@ class InferenceWorker:
             log.warning(
                 "Missing weights for %s in %s — running with random initialisation. "
                 "Anomaly scoring falls back to frame energy; run `murmur-train` first.",
-                ", ".join(missing), settings.MODEL_DIR,
+                ", ".join(missing),
+                settings.MODEL_DIR,
             )
             return False
 
@@ -341,7 +342,9 @@ class InferenceWorker:
                 PIPELINE_ERRORS.labels(stage="submit").inc()
                 log.warning(
                     "Telemetry API returned %s for node %s: %s",
-                    response.status_code, payload["node_id"], response.text[:200],
+                    response.status_code,
+                    payload["node_id"],
+                    response.text[:200],
                 )
                 return False
             return True

@@ -120,9 +120,7 @@ class SpatialGCNBlock(nn.Module):
         self.norm2 = nn.LayerNorm(out_channels)
         self.dropout = nn.Dropout(dropout)
         self.residual = (
-            nn.Linear(in_channels, out_channels)
-            if in_channels != out_channels
-            else nn.Identity()
+            nn.Linear(in_channels, out_channels) if in_channels != out_channels else nn.Identity()
         )
 
     def forward(

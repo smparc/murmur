@@ -44,12 +44,8 @@ class TestMockAudioGeneration:
         [FaultType.BEARING, FaultType.CAVITATION, FaultType.IMBALANCE],
     )
     def test_fault_raises_energy(self, fault):
-        healthy = np.frombuffer(
-            generate_mock_audio(0, fault=FaultType.NONE), dtype=np.float32
-        )
-        faulty = np.frombuffer(
-            generate_mock_audio(0, fault=fault, severity=1.0), dtype=np.float32
-        )
+        healthy = np.frombuffer(generate_mock_audio(0, fault=FaultType.NONE), dtype=np.float32)
+        faulty = np.frombuffer(generate_mock_audio(0, fault=fault, severity=1.0), dtype=np.float32)
         assert np.abs(faulty).mean() > np.abs(healthy).mean()
 
     def test_severity_scales_energy(self):
@@ -63,9 +59,7 @@ class TestMockAudioGeneration:
 
     def test_zero_severity_matches_healthy_energy(self):
         """A declared fault at zero severity must not inject any signal."""
-        healthy = np.frombuffer(
-            generate_mock_audio(1, fault=FaultType.NONE), dtype=np.float32
-        )
+        healthy = np.frombuffer(generate_mock_audio(1, fault=FaultType.NONE), dtype=np.float32)
         inert = np.frombuffer(
             generate_mock_audio(1, fault=FaultType.BEARING, severity=0.0), dtype=np.float32
         )

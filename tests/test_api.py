@@ -48,22 +48,29 @@ class TestValidation:
         assert "dim" in resp.text.lower()
 
     def test_negative_node_id_rejected(self, api_client):
-        assert api_client.post(
-            "/generate_telemetry", json=_valid_payload(node_id=-1)
-        ).status_code == 422
+        assert (
+            api_client.post("/generate_telemetry", json=_valid_payload(node_id=-1)).status_code
+            == 422
+        )
 
     def test_missing_fields_rejected(self, api_client):
         assert api_client.post("/generate_telemetry", json={"node_id": 0}).status_code == 422
 
     def test_out_of_range_score_rejected(self, api_client):
-        assert api_client.post(
-            "/generate_telemetry", json=_valid_payload(anomaly_score=1.5)
-        ).status_code == 422
+        assert (
+            api_client.post(
+                "/generate_telemetry", json=_valid_payload(anomaly_score=1.5)
+            ).status_code
+            == 422
+        )
 
     def test_unknown_severity_rejected(self, api_client):
-        assert api_client.post(
-            "/generate_telemetry", json=_valid_payload(anomaly_severity="catastrophic")
-        ).status_code == 422
+        assert (
+            api_client.post(
+                "/generate_telemetry", json=_valid_payload(anomaly_severity="catastrophic")
+            ).status_code
+            == 422
+        )
 
 
 class TestGeneration:
@@ -86,9 +93,10 @@ class TestGeneration:
 
     def test_generated_flag_reports_templated_fallback(self, api_client):
         # LLM_ENABLED is false in the test environment.
-        assert api_client.post("/generate_telemetry", json=_valid_payload()).json()[
-            "generated"
-        ] is False
+        assert (
+            api_client.post("/generate_telemetry", json=_valid_payload()).json()["generated"]
+            is False
+        )
 
 
 class TestMetrics:
@@ -134,19 +142,23 @@ class TestAuth:
             yield client
 
     def test_request_without_key_rejected(self, secured_client):
-        assert secured_client.post(
-            "/generate_telemetry", json=_valid_payload()
-        ).status_code == 401
+        assert secured_client.post("/generate_telemetry", json=_valid_payload()).status_code == 401
 
     def test_request_with_wrong_key_rejected(self, secured_client):
-        assert secured_client.post(
-            "/generate_telemetry", json=_valid_payload(), headers={"X-API-Key": "nope"}
-        ).status_code == 401
+        assert (
+            secured_client.post(
+                "/generate_telemetry", json=_valid_payload(), headers={"X-API-Key": "nope"}
+            ).status_code
+            == 401
+        )
 
     def test_request_with_correct_key_accepted(self, secured_client):
-        assert secured_client.post(
-            "/generate_telemetry", json=_valid_payload(), headers={"X-API-Key": "test-key"}
-        ).status_code == 200
+        assert (
+            secured_client.post(
+                "/generate_telemetry", json=_valid_payload(), headers={"X-API-Key": "test-key"}
+            ).status_code
+            == 200
+        )
 
     def test_health_stays_open_for_probes(self, secured_client):
         """Kubernetes probes cannot present credentials."""

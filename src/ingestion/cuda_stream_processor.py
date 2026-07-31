@@ -71,9 +71,7 @@ class SlidingWindowBuffer:
             raise ValueError(f"window_size must be >= 1, got {window_size}")
         self.window_size = window_size
         self.buffers: dict[int, deque] = {i: deque(maxlen=window_size) for i in range(num_nodes)}
-        self.timestamps: dict[int, deque] = {
-            i: deque(maxlen=window_size) for i in range(num_nodes)
-        }
+        self.timestamps: dict[int, deque] = {i: deque(maxlen=window_size) for i in range(num_nodes)}
 
     def push(self, node_id: int, spectrogram: np.ndarray, timestamp: float) -> None:
         if node_id not in self.buffers:
@@ -199,7 +197,9 @@ def decode_message(msg: Message) -> tuple[int, float, np.ndarray] | None:
         FRAMES_DROPPED.labels(node_id=node_label, reason="wrong_length").inc()
         log.warning(
             "Node %d sent %d samples, expected %d",
-            node_id, audio.size, settings.SAMPLES_PER_CHUNK,
+            node_id,
+            audio.size,
+            settings.SAMPLES_PER_CHUNK,
         )
         return None
 
@@ -248,7 +248,10 @@ def process_stream(max_batches: int | None = None) -> int:
 
     log.info(
         "Ingestion listening on %s (device=%s, window=%d frames, batch<=%d)",
-        settings.RAW_TOPIC, device, settings.SEQ_LENGTH, CONSUME_BATCH_SIZE,
+        settings.RAW_TOPIC,
+        device,
+        settings.SEQ_LENGTH,
+        CONSUME_BATCH_SIZE,
     )
 
     try:
@@ -272,7 +275,9 @@ def process_stream(max_batches: int | None = None) -> int:
                     consecutive_errors += 1
                     log.warning(
                         "Consumer error (%d/%d): %s",
-                        consecutive_errors, max_errors, msg.error(),
+                        consecutive_errors,
+                        max_errors,
+                        msg.error(),
                     )
                     if consecutive_errors >= max_errors:
                         log.critical("Too many consecutive consumer errors — shutting down")

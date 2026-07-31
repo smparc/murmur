@@ -11,9 +11,7 @@ from src.settings import ConfigError, Settings, settings
 
 class TestDerivedValues:
     def test_samples_per_chunk(self):
-        assert int(
-            settings.SAMPLE_RATE * settings.CHUNK_DURATION
-        ) == settings.SAMPLES_PER_CHUNK
+        assert int(settings.SAMPLE_RATE * settings.CHUNK_DURATION) == settings.SAMPLES_PER_CHUNK
 
     def test_num_nodes_matches_topology(self):
         assert len(settings.MIC_COORDS) == settings.NUM_NODES

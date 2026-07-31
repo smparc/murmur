@@ -110,8 +110,11 @@ def generate_degradation_data(
     if coords.shape[0] < num_nodes:
         # Pad with a synthetic line array if fewer coordinates than nodes.
         extra = np.stack(
-            [np.arange(coords.shape[0], num_nodes) * 5.0, np.zeros(num_nodes - coords.shape[0]),
-             np.full(num_nodes - coords.shape[0], 3.0)],
+            [
+                np.arange(coords.shape[0], num_nodes) * 5.0,
+                np.zeros(num_nodes - coords.shape[0]),
+                np.full(num_nodes - coords.shape[0], 3.0),
+            ],
             axis=1,
         )
         coords = np.vstack([coords, extra])
@@ -153,9 +156,7 @@ def generate_degradation_data(
             )
             envelope = severity * ramp * modulation  # (seq,)
 
-            contribution = (
-                envelope[:, None, None] * gains[None, :, None] * profile[None, None, :]
-            )
+            contribution = envelope[:, None, None] * gains[None, :, None] * profile[None, None, :]
             signal += 2.5 * contribution
             ttf = severity
         else:
@@ -164,9 +165,9 @@ def generate_degradation_data(
         x_all[i] = signal.astype(np.float32)
         y_all[i, 0] = ttf
         # 500 ms nominal cadence with edge-network jitter.
-        ts_all[i] = np.clip(
-            0.5 + rng.normal(0.0, 0.05, size=seq_length), 0.1, None
-        ).astype(np.float32)
+        ts_all[i] = np.clip(0.5 + rng.normal(0.0, 0.05, size=seq_length), 0.1, None).astype(
+            np.float32
+        )
 
     x = torch.from_numpy(x_all).reshape(num_sequences, seq_length, num_nodes * in_channels)
     return x, torch.from_numpy(y_all), torch.from_numpy(ts_all)
@@ -323,9 +324,9 @@ def train_autoencoder(
     split = int(0.85 * num_samples)
     train_x, val_x = data[:split].to(DEVICE), data[split:].to(DEVICE)
 
-    model = SpectrogramAutoencoder(
-        n_mels=settings.N_MELS, latent_dim=settings.AE_LATENT_DIM
-    ).to(DEVICE)
+    model = SpectrogramAutoencoder(n_mels=settings.N_MELS, latent_dim=settings.AE_LATENT_DIM).to(
+        DEVICE
+    )
     optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
     criterion = nn.MSELoss()
 
@@ -350,11 +351,16 @@ def train_autoencoder(
         if epoch % 5 == 0 or epoch == epochs - 1:
             log.info(
                 "  AE epoch %d/%d | train %.5f | val %.5f",
-                epoch, epochs, total / max(1, len(loader)), val_loss,
+                epoch,
+                epochs,
+                total / max(1, len(loader)),
+                val_loss,
             )
             if tracker:
-                tracker.log_metrics({"ae_train_loss": total / max(1, len(loader)),
-                                     "ae_val_loss": val_loss}, step=epoch)
+                tracker.log_metrics(
+                    {"ae_train_loss": total / max(1, len(loader)), "ae_val_loss": val_loss},
+                    step=epoch,
+                )
 
     model.eval()
     return model
@@ -458,8 +464,13 @@ def train_forecaster(
             lr = optimizer.param_groups[0]["lr"]
             log.info(
                 "  epoch %d/%d | train %.4f | val %.4f | MAE %.4f | F1 %.4f | lr %.2e",
-                epoch, settings.TRAIN_EPOCHS, avg_train, val_loss,
-                val_metrics["mae"], val_metrics["f1"], lr,
+                epoch,
+                settings.TRAIN_EPOCHS,
+                avg_train,
+                val_loss,
+                val_metrics["mae"],
+                val_metrics["f1"],
+                lr,
             )
             if tracker:
                 tracker.log_metrics(
@@ -539,9 +550,9 @@ def train_projector(
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(settings.LLM_MODEL_NAME)
-        llm = AutoModelForCausalLM.from_pretrained(
-            settings.LLM_MODEL_NAME, dtype=torch.float32
-        ).to(DEVICE)
+        llm = AutoModelForCausalLM.from_pretrained(settings.LLM_MODEL_NAME, dtype=torch.float32).to(
+            DEVICE
+        )
         llm.eval()
     except Exception:
         log.warning(
@@ -623,7 +634,9 @@ def train() -> dict[str, float]:
     num_samples = settings.TRAIN_NUM_SAMPLES
     log.info(
         "Generating %d sequences (seq_len=%d, nodes=%d)",
-        num_samples, settings.SEQ_LENGTH, num_nodes,
+        num_samples,
+        settings.SEQ_LENGTH,
+        num_nodes,
     )
     x, y, ts = generate_degradation_data(
         num_sequences=num_samples,
@@ -639,7 +652,9 @@ def train() -> dict[str, float]:
     splits = train_val_test_split(x, y, ts, generator=generator)
     log.info(
         "Split: train=%d val=%d test=%d",
-        splits["train"][0].size(0), splits["val"][0].size(0), splits["test"][0].size(0),
+        splits["train"][0].size(0),
+        splits["val"][0].size(0),
+        splits["test"][0].size(0),
     )
 
     os.makedirs(settings.MODEL_DIR, exist_ok=True)
@@ -684,7 +699,8 @@ def train() -> dict[str, float]:
     log.info("TEST RESULTS: %s", test_metrics)
     log.info(
         "Test MAE %.4f vs mean-predictor baseline %.4f",
-        test_metrics["mae"], test_metrics["baseline_mae"],
+        test_metrics["mae"],
+        test_metrics["baseline_mae"],
     )
     log.info("Weights written to %s/", settings.MODEL_DIR)
     return test_metrics

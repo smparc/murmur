@@ -115,16 +115,12 @@ def raw_acoustic_stream() -> MaterializeResult:
 def anomaly_detector_health() -> MaterializeResult:
     from src.detection.anomaly_detector import AnomalyScorer, SpectrogramAutoencoder
 
-    autoencoder = SpectrogramAutoencoder(
-        n_mels=settings.N_MELS, latent_dim=settings.AE_LATENT_DIM
-    )
+    autoencoder = SpectrogramAutoencoder(n_mels=settings.N_MELS, latent_dim=settings.AE_LATENT_DIM)
     weights_path = os.path.join(settings.MODEL_DIR, "autoencoder_weights.pth")
     loaded = os.path.exists(weights_path)
 
     if loaded:
-        autoencoder.load_state_dict(
-            torch.load(weights_path, map_location="cpu", weights_only=True)
-        )
+        autoencoder.load_state_dict(torch.load(weights_path, map_location="cpu", weights_only=True))
         log.info("Loaded autoencoder from %s", weights_path)
     else:
         log.warning("No autoencoder weights at %s — using random init", weights_path)

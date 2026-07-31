@@ -138,7 +138,9 @@ def worker(api_client, override_settings):
     w = InferenceWorker(
         inference_url="http://testserver", http_client=api_client, load_weights=False
     )
-    w.assembler = WindowAssembler(num_nodes=settings.NUM_NODES, seq_length=8, n_mels=settings.N_MELS)
+    w.assembler = WindowAssembler(
+        num_nodes=settings.NUM_NODES, seq_length=8, n_mels=settings.N_MELS
+    )
     yield w
 
 
@@ -196,9 +198,7 @@ class TestInferenceWorker:
             assert api_client.post("/generate_telemetry", json=payload).status_code == 200
 
     def test_submit_survives_unreachable_api(self):
-        w = InferenceWorker(
-            inference_url="http://127.0.0.1:1", load_weights=False
-        )
+        w = InferenceWorker(inference_url="http://127.0.0.1:1", load_weights=False)
         try:
             assert w.submit({"node_id": 0}) is False
         finally:

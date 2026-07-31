@@ -111,14 +111,16 @@ def topology_summary(
 ) -> dict[str, float]:
     """Diagnostics for logs and Dagster asset metadata."""
     edge_index, edge_weight = build_acoustic_topology(
-        mic_coordinates, distance_threshold, **kwargs  # type: ignore[arg-type]
+        mic_coordinates,
+        distance_threshold,
+        **kwargs,  # type: ignore[arg-type]
     )
     num_nodes = len(mic_coordinates)
     num_edges = int(edge_index.shape[1])
     max_edges = num_nodes * (num_nodes - 1)
 
-    degrees = torch.bincount(edge_index[0], minlength=num_nodes) if num_edges else torch.zeros(
-        num_nodes
+    degrees = (
+        torch.bincount(edge_index[0], minlength=num_nodes) if num_edges else torch.zeros(num_nodes)
     )
     isolated = int((degrees == 0).sum())
 
