@@ -305,4 +305,4 @@ settings = Settings()
 # Backwards-compatible alias: the topology used to be exposed under this name.
 DEFAULT_MIC_COORDS = _DEFAULT_MIC_COORDS
 
-__all__ = ["ConfigError", "Settings", "settings", "DEFAULT_MIC_COORDS"]
+__all__ = ["DEFAULT_MIC_COORDS", "ConfigError", "Settings", "settings"]

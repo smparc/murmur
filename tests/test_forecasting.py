@@ -1,12 +1,9 @@
 """Unit tests for the Liquid Neural Network forecasting module."""
 
 
-import pytest
 import torch
 
-
 from src.forecasting.liquid_network import AcousticForecastingLNN
-
 
 
 class TestAcousticForecastingLNN:

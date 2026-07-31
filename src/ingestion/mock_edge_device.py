@@ -14,14 +14,11 @@ import logging
 import time
 from enum import Enum
 
-
 import msgpack
 import numpy as np
 from confluent_kafka import Producer
 
-
 from src.settings import settings
-
 
 log = logging.getLogger(__name__)
 
@@ -80,9 +77,13 @@ def generate_mock_audio(
 
 
     elif fault == FaultType.CAVITATION and severity > 0:
-        # Broadband noise burst (pump cavitation)
-        burst = severity * np.random.normal(0, 0.5, settings.SAMPLES_PER_CHUNK)
-        # Add transient impulses
+        # Broadband noise burst (pump cavitation). This term was previously
+        # computed and then discarded, so the simulated cavitation signature
+        # consisted of impulses alone and was missing its defining
+        # characteristic — the broadband hiss of collapsing vapour bubbles.
+        base_noise += severity * np.random.normal(0, 0.5, settings.SAMPLES_PER_CHUNK)
+
+        # Transient impulses on top of the broadband component.
         n_impulses = max(1, int(severity * 5))
         for _ in range(n_impulses):
             pos = np.random.randint(0, settings.SAMPLES_PER_CHUNK)
@@ -123,8 +124,8 @@ def run_edge_simulation(max_loops: int | None = None) -> int:
 
 
     # Stochastic degradation state per node
-    node_degradation = {i: 0.0 for i in range(num_nodes)}
-    node_fault_type = {i: FaultType.NONE for i in range(num_nodes)}
+    node_degradation = dict.fromkeys(range(num_nodes), 0.0)
+    node_fault_type = dict.fromkeys(range(num_nodes), FaultType.NONE)
     anomaly_probability = 0.03  # 3% chance per frame of starting degradation
 
 

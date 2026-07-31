@@ -10,9 +10,9 @@ import os
 os.environ.setdefault("LLM_ENABLED", "false")
 os.environ.setdefault("MURMUR_API_KEY", "")
 
-import numpy as np  # noqa: E402
-import pytest  # noqa: E402
-import torch  # noqa: E402
+import numpy as np
+import pytest
+import torch
 
 SEED = 1337
 

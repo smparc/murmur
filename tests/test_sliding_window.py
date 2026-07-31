@@ -2,11 +2,8 @@
 
 
 import numpy as np
-import pytest
-
 
 from src.ingestion.cuda_stream_processor import SlidingWindowBuffer
-
 
 
 class TestSlidingWindowBuffer:
@@ -127,35 +124,37 @@ class TestMockEdgeDevice:
 
 
     def test_generate_normal_audio(self):
-        from src.ingestion.mock_edge_device import generate_mock_audio, FaultType
+        from src.ingestion.mock_edge_device import FaultType, generate_mock_audio
         audio_bytes = generate_mock_audio(0, fault=FaultType.NONE)
         assert isinstance(audio_bytes, bytes)
         assert len(audio_bytes) > 0
 
 
     def test_generate_bearing_fault(self):
-        from src.ingestion.mock_edge_device import generate_mock_audio, FaultType
+        from src.ingestion.mock_edge_device import FaultType, generate_mock_audio
         audio_bytes = generate_mock_audio(0, fault=FaultType.BEARING, severity=0.8)
         assert isinstance(audio_bytes, bytes)
 
 
     def test_generate_cavitation_fault(self):
-        from src.ingestion.mock_edge_device import generate_mock_audio, FaultType
+        from src.ingestion.mock_edge_device import FaultType, generate_mock_audio
         audio_bytes = generate_mock_audio(0, fault=FaultType.CAVITATION, severity=0.5)
         assert isinstance(audio_bytes, bytes)
 
 
     def test_generate_imbalance_fault(self):
-        from src.ingestion.mock_edge_device import generate_mock_audio, FaultType
+        from src.ingestion.mock_edge_device import FaultType, generate_mock_audio
         audio_bytes = generate_mock_audio(0, fault=FaultType.IMBALANCE, severity=0.6)
         assert isinstance(audio_bytes, bytes)
 
 
     def test_no_anomaly_flag_in_payload(self):
         """Ensure the payload no longer contains the data-leaking is_anomalous_flag."""
-        import msgpack
-        from src.ingestion.mock_edge_device import generate_mock_audio, FaultType
         import time
+
+        import msgpack
+
+        from src.ingestion.mock_edge_device import FaultType, generate_mock_audio
 
 
         audio_bytes = generate_mock_audio(0, fault=FaultType.BEARING, severity=0.5)
@@ -169,7 +168,7 @@ class TestMockEdgeDevice:
 
     def test_severity_scales_energy(self):
         """Higher severity should produce higher energy audio."""
-        from src.ingestion.mock_edge_device import generate_mock_audio, FaultType
+        from src.ingestion.mock_edge_device import FaultType, generate_mock_audio
 
 
         low = np.frombuffer(

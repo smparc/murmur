@@ -1,20 +1,16 @@
 """Unit tests for the Spatio-Temporal GNN and topology graph."""
 
 
-import pytest
 import torch
 
-
-from src.mapping.st_gnn_model import SpatioTemporalGNN, TemporalAttentionBlock, SpatialGCNBlock
+from src.mapping.st_gnn_model import SpatialGCNBlock, SpatioTemporalGNN, TemporalAttentionBlock
 from src.mapping.topology_graph import build_acoustic_topology
-
 
 
 class TestTopologyGraph:
     def test_build_topology_shapes(self):
         mics = [(0, 0, 0), (5, 0, 0), (0, 10, 0), (5, 10, 0)]
         edge_index, edge_weight = build_acoustic_topology(mics)
-
 
         assert edge_index.shape[0] == 2
         assert edge_index.shape[1] == edge_weight.shape[0]

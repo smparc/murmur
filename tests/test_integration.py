@@ -1,9 +1,9 @@
 """Integration test for the full pipeline (requires Kafka)."""
 
 
-import pytest
 import time
 
+import pytest
 
 # Skip this entire module if Kafka is not available
 pytest.importorskip("confluent_kafka")
@@ -28,7 +28,7 @@ class TestKafkaPipeline:
     def test_produce_and_consume_roundtrip(self, kafka_available):
         """Verify a message can roundtrip through Kafka."""
         import msgpack
-        from confluent_kafka import Producer, Consumer
+        from confluent_kafka import Consumer, Producer
 
 
         topic = "murmur-test-roundtrip"

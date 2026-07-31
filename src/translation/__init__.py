@@ -1,6 +1,6 @@
 """
 Large Language Model adapter and telemetry translation service.
 """
-from .llm_decoder import app, EmbeddingProjector, TelemetryRequest
+from .llm_decoder import EmbeddingProjector, TelemetryRequest, app
 
-__all__ = ["app", "EmbeddingProjector", "TelemetryRequest"]
+__all__ = ["EmbeddingProjector", "TelemetryRequest", "app"]

@@ -2,16 +2,12 @@
 
 
 import torch
-import pytest
-
 
 from src.training.train_pipeline import (
+    compute_metrics,
     generate_degradation_data,
     train_val_test_split,
-    compute_metrics,
 )
-from src.settings import settings
-
 
 
 class TestSyntheticDataGeneration:

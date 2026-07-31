@@ -2,12 +2,8 @@
 
 
 import torch
-import numpy as np
-import pytest
 
-
-from src.detection.anomaly_detector import SpectrogramAutoencoder, AnomalyScorer
-
+from src.detection.anomaly_detector import AnomalyScorer, SpectrogramAutoencoder
 
 
 class TestSpectrogramAutoencoder:
@@ -69,7 +65,7 @@ class TestSpectrogramAutoencoder:
     def test_gradients_flow(self):
         ae = SpectrogramAutoencoder(n_mels=64, latent_dim=32)
         x = torch.randn(2, 1, 64, 32, requires_grad=True)
-        recon, z = ae(x)
+        recon, _ = ae(x)
         loss = torch.nn.functional.mse_loss(recon, x)
         loss.backward()
         # Verify gradients propagate through the entire model
@@ -89,7 +85,7 @@ class TestAnomalyScorer:
         spec = torch.randn(1, 1, 64, 32)
 
 
-        for i in range(20):
+        for _ in range(20):
             result = scorer.score(node_id=0, spectrogram=spec)
             assert result.is_warmup is True
             assert result.is_anomaly is False
@@ -101,7 +97,7 @@ class TestAnomalyScorer:
 
 
         # Feed consistent normal data
-        for i in range(20):
+        for _ in range(20):
             spec = torch.randn(1, 1, 64, 32) * 0.1
             result = scorer.score(node_id=0, spectrogram=spec)
 
@@ -118,7 +114,7 @@ class TestAnomalyScorer:
 
 
         # Build baseline with low-energy data
-        for i in range(30):
+        for _ in range(30):
             spec = torch.randn(1, 1, 64, 32) * 0.01
             scorer.score(node_id=0, spectrogram=spec)
 
@@ -134,7 +130,7 @@ class TestAnomalyScorer:
 
 
         # Build baseline
-        for i in range(30):
+        for _ in range(30):
             spec = torch.randn(1, 1, 64, 32) * 0.01
             scorer.score(node_id=0, spectrogram=spec)
 
@@ -146,7 +142,7 @@ class TestAnomalyScorer:
 
         # Reset and build new baseline
         scorer2 = AnomalyScorer(autoencoder=None, num_nodes=4, warmup_frames=10, z_threshold=2.0)
-        for i in range(30):
+        for _ in range(30):
             spec = torch.randn(1, 1, 64, 32) * 0.01
             scorer2.score(node_id=0, spectrogram=spec)
 
@@ -166,7 +162,7 @@ class TestAnomalyScorer:
 
 
         # Only feed data to node 0
-        for i in range(10):
+        for _ in range(10):
             spec = torch.randn(1, 1, 64, 32)
             scorer.score(node_id=0, spectrogram=spec)
 
@@ -180,7 +176,7 @@ class TestAnomalyScorer:
         scorer = AnomalyScorer(autoencoder=None, num_nodes=2, warmup_frames=5)
 
 
-        for i in range(10):
+        for _ in range(10):
             for node in range(2):
                 spec = torch.randn(1, 1, 64, 32)
                 scorer.score(node_id=node, spectrogram=spec)
@@ -199,7 +195,7 @@ class TestAnomalyScorer:
         scorer = AnomalyScorer(autoencoder=ae, num_nodes=4, warmup_frames=10)
 
 
-        for i in range(15):
+        for _ in range(15):
             spec = torch.randn(1, 1, 64, 32) * 0.1
             result = scorer.score(node_id=0, spectrogram=spec)
 

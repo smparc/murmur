@@ -11,15 +11,15 @@ from src.settings import ConfigError, Settings, settings
 
 class TestDerivedValues:
     def test_samples_per_chunk(self):
-        assert settings.SAMPLES_PER_CHUNK == int(
+        assert int(
             settings.SAMPLE_RATE * settings.CHUNK_DURATION
-        )
+        ) == settings.SAMPLES_PER_CHUNK
 
     def test_num_nodes_matches_topology(self):
-        assert settings.NUM_NODES == len(settings.MIC_COORDS)
+        assert len(settings.MIC_COORDS) == settings.NUM_NODES
 
     def test_windowed_topic_derives_from_processed(self):
-        assert settings.WINDOWED_TOPIC == f"{settings.PROCESSED_TOPIC}-windowed"
+        assert f"{settings.PROCESSED_TOPIC}-windowed" == settings.WINDOWED_TOPIC
 
     def test_mel_frames_positive(self):
         assert settings.MEL_FRAMES_PER_CHUNK > 0

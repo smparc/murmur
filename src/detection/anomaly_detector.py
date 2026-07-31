@@ -154,7 +154,7 @@ class ScoreResult:
 class _NodeState:
     """Rolling baseline for a single microphone."""
 
-    __slots__ = ("scores", "total_frames", "anomaly_frames")
+    __slots__ = ("anomaly_frames", "scores", "total_frames")
 
     def __init__(self, window: int):
         self.scores: deque[float] = deque(maxlen=window)
