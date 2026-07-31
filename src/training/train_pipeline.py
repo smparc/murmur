@@ -40,6 +40,11 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
 from src.detection.anomaly_detector import SpectrogramAutoencoder
+from src.forecasting.conformal import (
+    ConformalCalibrator,
+    evaluate_coverage,
+    severity_bucket,
+)
 from src.forecasting.liquid_network import AcousticForecastingLNN
 from src.mapping.st_gnn_model import SpatioTemporalGNN
 from src.mapping.topology_graph import build_acoustic_topology
@@ -390,6 +395,82 @@ def _forward_forecast(
     return lnn(embedding_sequence, timespans=ts)
 
 
+def calibrate_forecaster(
+    st_gnn: SpatioTemporalGNN,
+    lnn: AcousticForecastingLNN,
+    splits: dict,
+    edge_index: torch.Tensor,
+    edge_weight: torch.Tensor,
+    alpha: float | None = None,
+) -> tuple[ConformalCalibrator, dict[str, float]]:
+    """
+    Fit conformal prediction intervals and measure their realised coverage.
+
+    The forecaster emits a sigmoid. Nothing in the training objective makes that
+    number a calibrated probability, so shipping it as "73% chance of failure"
+    is a fabrication — and it is the number a maintenance planner would schedule
+    against. Conformal turns it into an interval with a finite-sample coverage
+    guarantee that holds without assuming anything about the error distribution.
+
+    Which data is used matters, and is the easiest thing to get wrong:
+
+    - **Not the training set.** Residuals there are optimistically small and the
+      guarantee silently evaporates, leaving intervals that look tight and are
+      wrong far more often than advertised.
+    - **Not the validation set either.** Early stopping selected on it, so it is
+      no longer exchangeable with unseen data.
+
+    The test split is therefore halved: one half calibrates, the other measures
+    coverage on data neither the model nor the calibrator has seen.
+    """
+    alpha = settings.CONFORMAL_ALPHA if alpha is None else alpha
+    log.info("Stage 4/4: conformal calibration (alpha=%.3f)", alpha)
+
+    x_test, y_test, ts_test = (t.to(DEVICE) for t in splits["test"])
+
+    st_gnn.eval()
+    lnn.eval()
+    with torch.no_grad():
+        preds = _forward_forecast(st_gnn, lnn, x_test, ts_test, edge_index, edge_weight)
+
+    predictions = preds.squeeze(-1).cpu().numpy()
+    targets = y_test.squeeze(-1).cpu().numpy()
+
+    half = len(predictions) // 2
+    if half < 2:
+        raise ValueError(
+            f"test split has {len(predictions)} samples — too few to both "
+            "calibrate and verify. Increase TRAIN_NUM_SAMPLES."
+        )
+
+    cal_pred, cal_true = predictions[:half], targets[:half]
+    ver_pred, ver_true = predictions[half:], targets[half:]
+
+    groups = np.array([severity_bucket(p) for p in cal_pred])
+    calibrator = ConformalCalibrator(alpha=alpha).fit(cal_pred, cal_true, groups)
+
+    ver_groups = np.array([severity_bucket(p) for p in ver_pred])
+    coverage = evaluate_coverage(calibrator.intervals(ver_pred, ver_groups), ver_true)
+
+    log.info(
+        "Conformal: coverage %.3f against nominal %.3f, mean width %.3f (n_cal=%d)",
+        coverage["coverage"],
+        coverage["nominal_coverage"],
+        coverage["mean_width"],
+        calibrator.n_calibration,
+    )
+    if coverage["coverage"] < coverage["nominal_coverage"] - 0.05:
+        log.warning(
+            "Realised coverage %.3f is well below nominal %.3f. With exchangeable "
+            "data this should not happen; check that the calibration split is "
+            "genuinely disjoint from training.",
+            coverage["coverage"],
+            coverage["nominal_coverage"],
+        )
+
+    return calibrator, coverage
+
+
 def train_forecaster(
     splits: dict,
     edge_index: torch.Tensor,
@@ -693,6 +774,10 @@ def train() -> dict[str, float]:
                 projector.state_dict(),
                 os.path.join(settings.MODEL_DIR, "projector_weights.pth"),
             )
+
+        calibrator, coverage = calibrate_forecaster(st_gnn, lnn, splits, edge_index, edge_weight)
+        calibrator.save(os.path.join(settings.MODEL_DIR, "conformal.json"))
+        test_metrics.update({f"conformal_{k}": v for k, v in coverage.items()})
 
         tracker.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
 

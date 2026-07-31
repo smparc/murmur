@@ -195,6 +195,34 @@ class Settings:
         default_factory=lambda: _env_float("DISTANCE_DECAY_EXPONENT", 2.0)
     )
 
+    # -- Spatial acoustics (TDOA) --
+    # Cross-correlating every microphone pair costs an FFT per pair per chunk.
+    # It is cheap at 4 mics and quadratic thereafter, hence the switch.
+    TDOA_ENABLED: bool = field(default_factory=lambda: _env_bool("TDOA_ENABLED", True))
+    # Sub-sample interpolation factor. A 5 m array spans only ~230 samples of
+    # delay at 16 kHz, so raw sample resolution is coarse relative to the signal.
+    TDOA_INTERP: int = field(default_factory=lambda: _env_int("TDOA_INTERP", 8))
+    # Pairs below this correlation are excluded from the position solve.
+    TDOA_MIN_COHERENCE: float = field(
+        default_factory=lambda: _env_float("TDOA_MIN_COHERENCE", 0.15)
+    )
+    # Maximum clock spread across the array still treated as one instant.
+    # Delays being measured are ~15 ms, so edge clocks must be synchronised well
+    # inside this or the estimates are noise. See src/ingestion/spatial_probe.py.
+    TDOA_STALENESS_TOLERANCE: float = field(
+        default_factory=lambda: _env_float("TDOA_STALENESS_TOLERANCE", 0.5)
+    )
+    # How sharply measured coherence attenuates a geometric edge weight.
+    TDOA_EDGE_GAMMA: float = field(default_factory=lambda: _env_float("TDOA_EDGE_GAMMA", 1.0))
+    # Floor on that attenuation. A graph with every edge at zero has no
+    # propagation and the GCN collapses to a per-node MLP.
+    TDOA_EDGE_FLOOR: float = field(default_factory=lambda: _env_float("TDOA_EDGE_FLOOR", 0.05))
+
+    # -- Forecast uncertainty --
+    # Target miscoverage for conformal prediction intervals: 0.1 gives 90%
+    # coverage. See src/forecasting/conformal.py.
+    CONFORMAL_ALPHA: float = field(default_factory=lambda: _env_float("CONFORMAL_ALPHA", 0.1))
+
     def __post_init__(self) -> None:
         self._validate()
 
@@ -269,6 +297,19 @@ class Settings:
         if self.DISTANCE_THRESHOLD <= 0:
             errors.append(f"DISTANCE_THRESHOLD must be > 0, got {self.DISTANCE_THRESHOLD}")
 
+        if self.TDOA_INTERP < 1:
+            errors.append(f"TDOA_INTERP must be >= 1, got {self.TDOA_INTERP}")
+        if not 0 <= self.TDOA_MIN_COHERENCE <= 1:
+            errors.append(f"TDOA_MIN_COHERENCE must be in [0, 1], got {self.TDOA_MIN_COHERENCE}")
+        if not 0 <= self.TDOA_EDGE_FLOOR <= 1:
+            errors.append(f"TDOA_EDGE_FLOOR must be in [0, 1], got {self.TDOA_EDGE_FLOOR}")
+        if self.TDOA_STALENESS_TOLERANCE <= 0:
+            errors.append(
+                f"TDOA_STALENESS_TOLERANCE must be > 0, got {self.TDOA_STALENESS_TOLERANCE}"
+            )
+        if not 0 < self.CONFORMAL_ALPHA < 1:
+            errors.append(f"CONFORMAL_ALPHA must be in (0, 1), got {self.CONFORMAL_ALPHA}")
+
         if errors:
             raise ConfigError("Invalid Murmur configuration:\n  - " + "\n  - ".join(errors))
 
@@ -286,6 +327,11 @@ class Settings:
     def WINDOWED_TOPIC(self) -> str:
         """Topic carrying full ``SEQ_LENGTH`` temporal windows."""
         return f"{self.PROCESSED_TOPIC}-windowed"
+
+    @property
+    def SPATIAL_TOPIC(self) -> str:
+        """Topic carrying TDOA delays and source localization per instant."""
+        return f"{self.PROCESSED_TOPIC}-spatial"
 
     @property
     def MEL_FRAMES_PER_CHUNK(self) -> int:

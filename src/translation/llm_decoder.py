@@ -77,6 +77,24 @@ WS_SEND_TIMEOUT_SECONDS = 5.0
 # ---------------------------------------------------------------------------
 
 
+class TTFInterval(BaseModel):
+    """
+    A calibrated band around the failure forecast.
+
+    A bare sigmoid is not a probability — nothing in the training objective
+    makes 0.73 mean "fails 73% of the time". These bounds come from split
+    conformal calibration and carry a finite-sample coverage guarantee, which
+    is what makes the forecast safe to schedule maintenance against.
+    """
+
+    point: float = Field(ge=0.0, le=1.0)
+    lower: float = Field(ge=0.0, le=1.0)
+    upper: float = Field(ge=0.0, le=1.0)
+    width: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    group: str = "global"
+
+
 class TelemetryRequest(BaseModel):
     """One scored frame, submitted by the inference worker."""
 
@@ -88,6 +106,18 @@ class TelemetryRequest(BaseModel):
     ttf_prediction: float = Field(0.0, ge=0.0, le=1.0)
     is_anomaly: bool = False
     z_score: float = 0.0
+    # Optional enrichments. Absent when the pipeline has no conformal
+    # calibration, or when TDOA is disabled or the array failed to resolve a
+    # source — both are degraded-but-valid states, not errors.
+    ttf_interval: TTFInterval | None = None
+    source_position: list[float] | None = None
+
+    @field_validator("source_position")
+    @classmethod
+    def validate_source_position(cls, v: list[float] | None) -> list[float] | None:
+        if v is not None and len(v) != 3:
+            raise ValueError(f"source_position must be an (x, y, z) triple, got {len(v)} values")
+        return v
 
     @field_validator("node_id")
     @classmethod
@@ -127,6 +157,8 @@ class TelemetryResponse(BaseModel):
     anomaly: AnomalyBlock
     ttf_prediction: float
     generated: bool = Field(description="True when an LLM produced the text; False when templated.")
+    ttf_interval: TTFInterval | None = None
+    source_position: list[float] | None = None
 
 
 class HealthResponse(BaseModel):
@@ -492,6 +524,8 @@ async def generate_telemetry(request: TelemetryRequest) -> TelemetryResponse:
         ),
         ttf_prediction=round(request.ttf_prediction, 4),
         generated=generated,
+        ttf_interval=request.ttf_interval,
+        source_position=request.source_position,
     )
 
     payload = response.model_dump()

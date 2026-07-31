@@ -126,6 +126,28 @@ KAFKA_CONSUMER_LAG = Gauge(
     ["topic", "partition"],
 )
 
+# -- Spatial acoustics --
+
+ACOUSTIC_COHERENCE = Gauge(
+    "murmur_acoustic_coherence",
+    "Mean GCC-PHAT correlation peak across microphone pairs (0-1)",
+)
+
+ARRAY_CLOCK_SPREAD = Gauge(
+    "murmur_array_clock_spread_seconds",
+    "Timestamp spread across the microphone array for one acoustic instant",
+)
+"""
+Alert on this. Inter-microphone delays span ~15 ms on a 5 m array, so once edge
+clock skew approaches that, every TDOA estimate and every source position
+derived from it is noise wearing a confident number.
+"""
+
+SOURCE_LOCALIZED = Counter(
+    "murmur_source_localizations_total",
+    "Acoustic instants that yielded a source position",
+)
+
 PIPELINE_ERRORS = Counter(
     "murmur_pipeline_errors_total",
     "Unrecoverable errors by stage",
@@ -231,10 +253,12 @@ def render() -> bytes:
 
 
 __all__ = [
+    "ACOUSTIC_COHERENCE",
     "ACTIVE_WS_CLIENTS",
     "ANOMALY_COUNT",
     "ANOMALY_SCORE",
     "ANOMALY_Z_SCORE",
+    "ARRAY_CLOCK_SPREAD",
     "CONTENT_TYPE",
     "END_TO_END_LATENCY",
     "FRAMES_DROPPED",
@@ -245,6 +269,7 @@ __all__ = [
     "PIPELINE_ERRORS",
     "REQUEST_COUNT",
     "REQUEST_LATENCY",
+    "SOURCE_LOCALIZED",
     "TTF_PREDICTION",
     "record_consumer_lag",
     "render",

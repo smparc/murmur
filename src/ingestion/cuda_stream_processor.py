@@ -32,10 +32,14 @@ import torch
 import torchaudio
 from confluent_kafka import Consumer, KafkaError, Message, Producer
 
+from src.ingestion.spatial_probe import SpatialProbe
 from src.observability.metrics import (
+    ACOUSTIC_COHERENCE,
+    ARRAY_CLOCK_SPREAD,
     FRAMES_DROPPED,
     FRAMES_PROCESSED,
     PIPELINE_ERRORS,
+    SOURCE_LOCALIZED,
     record_consumer_lag,
 )
 from src.settings import settings
@@ -240,6 +244,20 @@ def process_stream(max_batches: int | None = None) -> int:
     buffer = SlidingWindowBuffer(settings.SEQ_LENGTH, settings.NUM_NODES)
     shutdown = _Shutdown() if max_batches is None else None
 
+    # TDOA has to be measured here, on raw waveforms: the mel transform below
+    # discards phase, and phase is where the inter-channel delay lives.
+    probe = (
+        SpatialProbe(
+            mic_coords=np.asarray(settings.MIC_COORDS, dtype=np.float64),
+            sample_rate=settings.SAMPLE_RATE,
+            staleness_tolerance=settings.TDOA_STALENESS_TOLERANCE,
+            min_coherence=settings.TDOA_MIN_COHERENCE,
+            interp=settings.TDOA_INTERP,
+        )
+        if settings.TDOA_ENABLED
+        else None
+    )
+
     consecutive_errors = 0
     max_errors = 50
     frames_processed = 0
@@ -305,10 +323,16 @@ def process_stream(max_batches: int | None = None) -> int:
                 log.exception("Mel transform failed for a batch of %d", len(decoded))
                 continue
 
-            for (node_id, timestamp, _), spec in zip(decoded, spectrograms, strict=True):
+            for (node_id, timestamp, raw), spec in zip(decoded, spectrograms, strict=True):
                 _publish(producer, buffer, node_id, timestamp, spec)
                 frames_processed += 1
                 FRAMES_PROCESSED.labels(node_id=str(node_id)).inc()
+
+                if probe is not None:
+                    probe.push(node_id, timestamp, raw)
+
+            if probe is not None:
+                _publish_spatial(producer, probe)
 
             producer.poll(0)
 
@@ -335,6 +359,38 @@ def process_stream(max_batches: int | None = None) -> int:
         consumer.close()
 
     return frames_processed
+
+
+def _publish_spatial(producer: Producer, probe: SpatialProbe) -> None:
+    """
+    Solve the array and emit acoustic geometry, if a full instant is available.
+
+    Failure here must never stall ingestion: localization is an enrichment, and
+    the pipeline has to keep delivering spectrograms if the array is incomplete
+    or the geometry is degenerate.
+    """
+    try:
+        snapshot = probe.solve()
+    except Exception:
+        PIPELINE_ERRORS.labels(stage="spatial_probe").inc()
+        log.warning("Spatial probe failed", exc_info=True)
+        probe.reset()
+        return
+
+    if snapshot is None:
+        return
+
+    ACOUSTIC_COHERENCE.set(snapshot.mean_coherence)
+    ARRAY_CLOCK_SPREAD.set(snapshot.clock_spread)
+    if snapshot.localized:
+        SOURCE_LOCALIZED.inc()
+
+    # Unkeyed: a spatial snapshot describes the whole array, not one node.
+    producer.produce(
+        settings.SPATIAL_TOPIC,
+        value=msgpack.packb(snapshot.to_payload(), use_bin_type=True),
+        callback=_delivery_callback,
+    )
 
 
 def _publish(

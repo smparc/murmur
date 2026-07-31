@@ -41,8 +41,10 @@ import numpy as np
 import torch
 
 from src.detection.anomaly_detector import AnomalyScorer, ScoreResult, SpectrogramAutoencoder
+from src.forecasting.conformal import ConformalCalibrator, severity_bucket
 from src.forecasting.liquid_network import AcousticForecastingLNN
 from src.mapping.st_gnn_model import SpatioTemporalGNN
+from src.mapping.tdoa import TDOAEstimate, tdoa_edge_weights
 from src.mapping.topology_graph import build_acoustic_topology
 from src.observability.metrics import (
     PIPELINE_ERRORS,
@@ -195,6 +197,15 @@ class InferenceWorker:
         self.edge_index = edge_index.to(DEVICE)
         self.edge_weight = edge_weight.to(DEVICE)
 
+        # The geometric weights above describe the building. TDOA coherence,
+        # applied below, describes what the building currently sounds like; the
+        # effective weights are the product. Until a spatial snapshot arrives
+        # the graph falls back to pure geometry, which is the old behaviour.
+        self._static_edge_index = edge_index.cpu().numpy()
+        self._static_edge_weight = edge_weight.cpu().numpy()
+        self.effective_edge_weight = self.edge_weight
+        self.spatial: dict | None = None
+
         self.st_gnn = SpatioTemporalGNN(
             in_channels=settings.N_MELS,
             hidden_channels=settings.GNN_HIDDEN_CHANNELS,
@@ -233,9 +244,73 @@ class InferenceWorker:
             n_mels=settings.N_MELS,
         )
 
+        self.calibrator = self._load_calibrator()
+
         self._client = http_client or httpx.Client(timeout=30.0)
         self._owns_client = http_client is None
         self._throttled = 0
+
+    def _load_calibrator(self) -> ConformalCalibrator | None:
+        """
+        Load conformal calibration, if the training run produced any.
+
+        Absent calibration means forecasts ship as bare point estimates. That is
+        a downgrade, not a failure — but it is logged, because an uncalibrated
+        sigmoid presented as a failure probability is exactly the kind of number
+        that gets acted on and should not be.
+        """
+        path = os.path.join(settings.MODEL_DIR, "conformal.json")
+        if not os.path.exists(path):
+            log.warning(
+                "No conformal calibration at %s — TTF forecasts will carry no "
+                "uncertainty bounds. Run `murmur-train` to produce one.",
+                path,
+            )
+            return None
+        try:
+            calibrator = ConformalCalibrator.load(path)
+            log.info(
+                "Loaded conformal calibration (alpha=%.3f, n=%d, groups=%s)",
+                calibrator.alpha,
+                calibrator.n_calibration,
+                sorted(calibrator.group_radii) or "none",
+            )
+            return calibrator
+        except Exception:
+            log.exception("Could not load conformal calibration from %s", path)
+            return None
+
+    # -- spatial acoustics --------------------------------------------------
+
+    def apply_spatial(self, payload: dict) -> None:
+        """
+        Adopt a TDOA snapshot, reweighting the graph by measured coherence.
+
+        Pairs that have fallen out of correlation stop propagating, so the graph
+        effectively re-partitions itself around whatever is actually making
+        noise instead of around the floorplan.
+        """
+        pairs = payload.get("pairs") or []
+        estimates = [
+            TDOAEstimate(
+                i=int(p["i"]),
+                j=int(p["j"]),
+                tau=float(p["tau"]),
+                coherence=float(p["coherence"]),
+                max_tau=float("inf"),
+            )
+            for p in pairs
+        ]
+
+        weights = tdoa_edge_weights(
+            self._static_edge_index,
+            estimates,
+            self._static_edge_weight,
+            gamma=settings.TDOA_EDGE_GAMMA,
+            floor=settings.TDOA_EDGE_FLOOR,
+        )
+        self.effective_edge_weight = torch.from_numpy(weights).float().to(DEVICE)
+        self.spatial = payload
 
     def _load_weights(self) -> bool:
         """Load trained weights; fall back to energy-based scoring if absent."""
@@ -283,7 +358,7 @@ class InferenceWorker:
             # The sequence form is what gives the Liquid Network genuine
             # temporal structure to integrate.
             embedding_sequence = self.st_gnn(
-                x, self.edge_index, self.edge_weight, return_sequence=True
+                x, self.edge_index, self.effective_edge_weight, return_sequence=True
             )
 
         with track_inference("lnn"):
@@ -291,6 +366,17 @@ class InferenceWorker:
 
         graph_embedding = embedding_sequence.mean(dim=1).squeeze(0).cpu().tolist()
         ttf_value = float(ttf.squeeze().item())
+
+        # A calibrated band around the point forecast. Grouped by severity so
+        # coverage holds within the high-risk stratum rather than only on
+        # average across a population dominated by healthy machines.
+        interval = None
+        if self.calibrator is not None:
+            interval = self.calibrator.interval(ttf_value, severity_bucket(ttf_value)).as_dict()
+
+        source_position = None
+        if self.spatial is not None:
+            source_position = self.spatial.get("position")
 
         payloads: list[dict] = []
         for node_id in range(self.num_nodes):
@@ -301,18 +387,21 @@ class InferenceWorker:
             frame = torch.from_numpy(window.latest_frame).float()
             result: ScoreResult = self.scorer.score(node_id, frame)
 
-            payloads.append(
-                {
-                    "node_id": node_id,
-                    "timestamp": window.timestamp,
-                    "gnn_embedding": graph_embedding,
-                    "anomaly_score": round(result.normalized_score, 6),
-                    "anomaly_severity": result.severity,
-                    "ttf_prediction": round(ttf_value, 6),
-                    "is_anomaly": result.is_anomaly,
-                    "z_score": round(result.z_score, 4),
-                }
-            )
+            payload = {
+                "node_id": node_id,
+                "timestamp": window.timestamp,
+                "gnn_embedding": graph_embedding,
+                "anomaly_score": round(result.normalized_score, 6),
+                "anomaly_severity": result.severity,
+                "ttf_prediction": round(ttf_value, 6),
+                "is_anomaly": result.is_anomaly,
+                "z_score": round(result.z_score, 4),
+            }
+            if interval is not None:
+                payload["ttf_interval"] = interval
+            if source_position is not None:
+                payload["source_position"] = source_position
+            payloads.append(payload)
         return payloads
 
     def submit(self, payload: dict) -> bool:
@@ -404,7 +493,10 @@ def run_worker(max_batches: int | None = None) -> int:
             "max.poll.interval.ms": 300_000,
         }
     )
-    consumer.subscribe([settings.WINDOWED_TOPIC])
+    topics = [settings.WINDOWED_TOPIC]
+    if settings.TDOA_ENABLED:
+        topics.append(settings.SPATIAL_TOPIC)
+    consumer.subscribe(topics)
 
     worker = InferenceWorker()
     shutdown = _Shutdown() if max_batches is None else None
@@ -438,6 +530,17 @@ def run_worker(max_batches: int | None = None) -> int:
                     if msg.error().code() != KafkaError._PARTITION_EOF:
                         log.warning("Consumer error: %s", msg.error())
                     continue
+
+                if msg.topic() == settings.SPATIAL_TOPIC:
+                    # Enrichment only: a bad spatial frame must never stop
+                    # telemetry, so the graph simply keeps its previous weights.
+                    try:
+                        worker.apply_spatial(msgpack.unpackb(msg.value(), raw=False))
+                    except Exception:
+                        PIPELINE_ERRORS.labels(stage="spatial_apply").inc()
+                        log.warning("Could not apply spatial snapshot", exc_info=True)
+                    continue
+
                 window = decode_window(msg.value())
                 if window is None:
                     continue
@@ -455,7 +558,7 @@ def run_worker(max_batches: int | None = None) -> int:
 
             now = time.monotonic()
             if now - last_lag_sample > 10.0:
-                record_consumer_lag(consumer, [settings.WINDOWED_TOPIC])
+                record_consumer_lag(consumer, topics)
                 last_lag_sample = now
 
     except KeyboardInterrupt:  # pragma: no cover
