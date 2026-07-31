@@ -126,6 +126,38 @@ KAFKA_CONSUMER_LAG = Gauge(
     ["topic", "partition"],
 )
 
+# -- Array liveness --
+
+ARRAY_NODES_REPORTING = Gauge(
+    "murmur_array_nodes_reporting",
+    "Microphones contributing to the most recent graph snapshot",
+)
+"""
+Alert on this dropping below the configured array size.
+
+A snapshot assembled from a subset of the array is still useful, but the
+spatial model is reasoning over a graph with holes in it, and the operator has
+to know that before trusting a per-node score.
+"""
+
+SNAPSHOTS_EMITTED = Counter(
+    "murmur_snapshots_total",
+    "Graph snapshots released for inference",
+    ["mode"],  # complete | degraded
+)
+
+NODE_DROPPED = Counter(
+    "murmur_node_dropped_total",
+    "Microphones evicted from the assembler for exceeding the staleness bound",
+    ["node_id"],
+)
+
+TELEMETRY_DROPPED = Counter(
+    "murmur_telemetry_dropped_total",
+    "Scored payloads the telemetry API refused or was unreachable for",
+    ["node_id"],
+)
+
 # -- Spatial acoustics --
 
 ACOUSTIC_COHERENCE = Gauge(
