@@ -2,9 +2,10 @@
 GPU stream processor: Kafka -> mel-spectrogram -> sliding window -> Kafka.
 
 Consumes raw audio, computes log-mel spectrograms on the GPU, maintains a
-per-node temporal buffer of ``SEQ_LENGTH`` frames, and republishes both single
-frames (for low-latency anomaly scoring) and complete temporal windows (for the
-ST-GNN and Liquid Network).
+per-node temporal buffer of ``SEQ_LENGTH`` frames, and republishes complete
+temporal windows for the ST-GNN and Liquid Network. Single frames are also
+available on ``PROCESSED_TOPIC``, but only when ``PUBLISH_FRAME_TOPIC`` is set:
+nothing in Murmur consumes them.
 
 Two details carry most of the throughput:
 
@@ -12,10 +13,11 @@ Two details carry most of the throughput:
   once across all of them. Per-message GPU calls on an 8000-sample chunk are
   dominated by kernel-launch and transfer overhead, so a "GPU-accelerated"
   pipeline that processes one message at a time is barely faster than CPU.
-- **Manual offset commits.** Offsets advance only after downstream publish
-  succeeds. Auto-commit acknowledges data the moment it is polled, so a crash
-  mid-batch silently loses frames — unacceptable for a system whose value
-  proposition is not missing events.
+- **Manual offset commits.** The producer queue is drained and offsets advance
+  only once the broker has acknowledged the derived frames. Auto-commit
+  acknowledges data the moment it is polled, so a crash mid-batch silently
+  loses frames — unacceptable for a system whose value proposition is not
+  missing events.
 """
 
 from __future__ import annotations
@@ -51,6 +53,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Upper bound on messages fused into a single GPU call.
 CONSUME_BATCH_SIZE = 32
 CONSUME_TIMEOUT_SECONDS = 0.5
+# How long to wait for the producer queue to drain before advancing offsets.
+# Generous, because failing to drain holds the batch for redelivery rather than
+# dropping it — the cost of overshooting is latency, not data.
+PRODUCER_FLUSH_TIMEOUT = 10.0
 
 
 # ---------------------------------------------------------------------------
@@ -334,14 +340,31 @@ def process_stream(max_batches: int | None = None) -> int:
             if probe is not None:
                 _publish_spatial(producer, probe)
 
-            producer.poll(0)
-
-            # Offsets advance only now that the derived frames are queued.
-            try:
-                consumer.commit(asynchronous=True)
-            except Exception:
-                PIPELINE_ERRORS.labels(stage="commit").inc()
-                log.warning("Offset commit failed", exc_info=True)
+            # Drain the queue before advancing offsets. produce() only enqueues,
+            # and poll(0) merely serves callbacks for sends that already
+            # completed — committing on that basis acknowledges frames still
+            # sitting in librdkafka's buffer, so a crash in that window loses
+            # precisely the data the at-least-once guarantee exists to protect.
+            # enable.idempotence and acks=all prevent broker-side duplication;
+            # neither says anything about messages that never left the client.
+            remaining = producer.flush(timeout=PRODUCER_FLUSH_TIMEOUT)
+            if remaining:
+                # Holding the offsets means this batch is redelivered. Duplicate
+                # spectrograms are harmless downstream (the worker keys windows
+                # by node and timestamp); missing ones are not.
+                PIPELINE_ERRORS.labels(stage="producer_flush").inc()
+                log.warning(
+                    "%d message(s) undelivered after %.0fs — holding offsets for "
+                    "redelivery rather than acknowledging unsent frames.",
+                    remaining,
+                    PRODUCER_FLUSH_TIMEOUT,
+                )
+            else:
+                try:
+                    consumer.commit(asynchronous=False)
+                except Exception:
+                    PIPELINE_ERRORS.labels(stage="commit").inc()
+                    log.warning("Offset commit failed", exc_info=True)
 
             now = time.monotonic()
             if now - last_lag_sample > 10.0:
@@ -400,27 +423,34 @@ def _publish(
     timestamp: float,
     spec: np.ndarray,
 ) -> None:
-    """Emit the single frame, plus the full window once one is available."""
+    """Emit the full window, and the single frame if anything is listening."""
     buffer.push(node_id, spec, timestamp)
     key = str(node_id).encode("utf-8")
 
     # Keying by node keeps a node's frames on one partition, which is what lets
     # the in-process window buffer stay coherent across a consumer group.
-    producer.produce(
-        settings.PROCESSED_TOPIC,
-        key=key,
-        value=msgpack.packb(
-            {
-                "node_id": node_id,
-                "timestamp": timestamp,
-                "spectrogram_shape": list(spec.shape),
-                "spectrogram": spec.astype(np.float32).tobytes(),
-                "window_ready": buffer.is_ready(node_id),
-            },
-            use_bin_type=True,
-        ),
-        callback=_delivery_callback,
-    )
+    #
+    # The per-frame topic is opt-in. Nothing inside Murmur subscribes to it —
+    # the inference worker consumes WINDOWED_TOPIC — so publishing it by default
+    # serialized, compressed and shipped every frame from every node to a broker
+    # for no reader, and paid retention on it. It stays available for external
+    # consumers, but a deployment has to ask for it.
+    if settings.PUBLISH_FRAME_TOPIC:
+        producer.produce(
+            settings.PROCESSED_TOPIC,
+            key=key,
+            value=msgpack.packb(
+                {
+                    "node_id": node_id,
+                    "timestamp": timestamp,
+                    "spectrogram_shape": list(spec.shape),
+                    "spectrogram": spec.astype(np.float32).tobytes(),
+                    "window_ready": buffer.is_ready(node_id),
+                },
+                use_bin_type=True,
+            ),
+            callback=_delivery_callback,
+        )
 
     if buffer.is_ready(node_id):
         window, timespans = buffer.get_window(node_id)

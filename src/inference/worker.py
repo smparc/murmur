@@ -460,23 +460,31 @@ class InferenceWorker:
 
         with track_inference("st_gnn"):
             # The sequence form is what gives the Liquid Network genuine
-            # temporal structure to integrate.
-            embedding_sequence = self.st_gnn(
-                x, self.edge_index, self.effective_edge_weight, return_sequence=True
+            # temporal structure to integrate. The per-node form is what lets a
+            # forecast be attributed to one microphone.
+            _graph_sequence, node_sequence = self.st_gnn(
+                x,
+                self.edge_index,
+                self.effective_edge_weight,
+                return_sequence=True,
+                return_nodes=True,
             )
 
+        B, S, N, E = node_sequence.shape
+
         with track_inference("lnn"):
-            ttf = self.lnn(embedding_sequence, timespans=timespans)
+            # One forecast per microphone, from that microphone's own embedding
+            # trajectory. Previously a single facility-level TTF was computed
+            # from the pooled graph readout and copied into every node's
+            # payload, so the dashboard's per-node cards were identical by
+            # construction — an operator reading them as four independent
+            # machine forecasts was reading the same number four times.
+            per_node = node_sequence.permute(0, 2, 1, 3).reshape(B * N, S, E)
+            node_timespans = timespans.repeat_interleave(N, dim=0)
+            node_ttf = self.lnn(per_node, timespans=node_timespans).view(B, N)
 
-        graph_embedding = embedding_sequence.mean(dim=1).squeeze(0).cpu().tolist()
-        ttf_value = float(ttf.squeeze().item())
-
-        # A calibrated band around the point forecast. Grouped by severity so
-        # coverage holds within the high-risk stratum rather than only on
-        # average across a population dominated by healthy machines.
-        interval = None
-        if self.calibrator is not None:
-            interval = self.calibrator.interval(ttf_value, severity_bucket(ttf_value)).as_dict()
+        node_embeddings = node_sequence.mean(dim=1).squeeze(0).cpu()  # (N, E)
+        ttf_by_node = node_ttf.squeeze(0).cpu().tolist()
 
         source_position = None
         if self.spatial is not None:
@@ -490,11 +498,19 @@ class InferenceWorker:
 
             frame = torch.from_numpy(window.latest_frame).float()
             result: ScoreResult = self.scorer.score(node_id, frame)
+            ttf_value = float(ttf_by_node[node_id])
+
+            # A calibrated band around the point forecast. Grouped by severity so
+            # coverage holds within the high-risk stratum rather than only on
+            # average across a population dominated by healthy machines.
+            interval = None
+            if self.calibrator is not None:
+                interval = self.calibrator.interval(ttf_value, severity_bucket(ttf_value)).as_dict()
 
             payload = {
                 "node_id": node_id,
                 "timestamp": window.timestamp,
-                "gnn_embedding": graph_embedding,
+                "gnn_embedding": node_embeddings[node_id].tolist(),
                 "anomaly_score": round(result.normalized_score, 6),
                 "anomaly_severity": result.severity,
                 "ttf_prediction": round(ttf_value, 6),

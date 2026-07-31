@@ -12,6 +12,7 @@ import time
 
 import numpy as np
 import pytest
+import torch
 
 from src.inference.worker import InferenceWorker, NodeWindow, WindowAssembler, decode_window
 from src.settings import settings
@@ -81,6 +82,99 @@ class TestWindowAssembler:
         assembler.push(_window(0, 100.0, seq=4))
         assembler.clear()
         assert not assembler.is_complete()
+
+
+class TestDegradedArray:
+    """
+    One dead microphone must not silence the array.
+
+    The assembler previously required every node with no timeout and no
+    eviction, so a single dropout meant the healthy microphones streamed
+    indefinitely and nothing was ever emitted. The dashboard then showed
+    "waiting for model predictions", which is visually identical to a healthy,
+    quiet plant — the worst available failure mode for a monitoring system.
+    """
+
+    def _assembler(self, **kwargs):
+        defaults = dict(
+            num_nodes=4,
+            seq_length=8,
+            n_mels=settings.N_MELS,
+            staleness_tolerance=5.0,
+            max_wait=1.0,
+            min_nodes=2,
+        )
+        return WindowAssembler(**{**defaults, **kwargs})
+
+    def test_dead_microphone_releases_a_degraded_snapshot(self):
+        assembler = self._assembler()
+        for node in range(3):
+            assembler.push(_window(node, 100.0))
+
+        # Inside the grace period the array still waits for the fourth mic.
+        assert not assembler.is_complete()
+
+        # Past it, three healthy microphones are worth more than silence.
+        assert assembler.is_complete(now=time.monotonic() + 5.0)
+
+    def test_degraded_snapshot_zero_fills_and_omits_the_absent_node(self):
+        assembler = self._assembler()
+        for node in range(3):
+            assembler.push(_window(node, 100.0))
+        assert assembler.is_complete(now=time.monotonic() + 5.0)
+
+        x, timespans, snapshot = assembler.assemble()
+
+        # Fixed tensor shape: the topology is indexed by position, so a missing
+        # node has to keep its slot or every edge after it misaligns.
+        assert x.shape == (1, 8, 4 * settings.N_MELS)
+        assert timespans.shape == (1, 8)
+        mels = settings.N_MELS
+        assert torch.allclose(x[0, :, 3 * mels : 4 * mels], torch.zeros(8, mels))
+
+        # ...but no telemetry is fabricated for a microphone that said nothing.
+        assert set(snapshot) == {0, 1, 2}
+        assert assembler.last_missing == {3}
+
+    def test_stale_node_is_evicted_so_the_array_recovers(self):
+        """
+        A stale window must be dropped, not retained. Left in place, the spread
+        between newest and oldest never falls back inside tolerance, so even the
+        surviving microphones stop producing snapshots — a permanent stall that
+        no metric reported.
+        """
+        assembler = self._assembler(num_nodes=2, min_nodes=1)
+        assembler.push(_window(0, 100.0))
+        assembler.push(_window(1, 100.0))
+        assert assembler.is_complete()
+        assembler.clear()
+
+        # Node 1 dies; node 0 keeps reporting well past the staleness bound.
+        assembler.push(_window(1, 200.0))
+        for step in range(5):
+            assembler.push(_window(0, 260.0 + step))
+
+        # The stale window is gone rather than blocking forever.
+        assert 1 not in assembler._windows
+        assert assembler.is_complete(now=time.monotonic() + 5.0)
+
+    def test_below_quorum_emits_nothing(self):
+        """A graph too sparse to convolve is worse than no answer."""
+        assembler = self._assembler(min_nodes=3)
+        for node in range(2):
+            assembler.push(_window(node, 100.0))
+        assert not assembler.is_complete(now=time.monotonic() + 60.0)
+
+    def test_window_of_the_wrong_length_is_rejected_not_raised(self):
+        """
+        A SEQ_LENGTH mismatch between ingestion and the worker used to reach
+        assemble() and raise on the reshape, once per snapshot, forever. It is
+        a configuration error, so it is reported once per node and dropped.
+        """
+        assembler = self._assembler()
+        assert assembler.push(_window(0, 100.0, seq=8)) is True
+        assert assembler.push(_window(1, 100.0, seq=7)) is False
+        assert 1 not in assembler._windows
 
 
 class TestDecodeWindow:
@@ -196,6 +290,50 @@ class TestInferenceWorker:
 
         for payload in payloads:
             assert api_client.post("/generate_telemetry", json=payload).status_code == 200
+
+    def test_forecast_and_embedding_are_per_node(self, worker):
+        """
+        Each card on the dashboard must describe its own machine.
+
+        A single facility-level TTF and graph embedding were previously computed
+        from the pooled graph readout and copied into every node's payload, so
+        the per-node cards were identical by construction. An operator reading
+        four "Node N — 47.3%" tiles was reading one number four times.
+        """
+        now = time.time()
+        payloads: list[dict] = []
+        for node in range(settings.NUM_NODES):
+            # Give each microphone a genuinely different acoustic picture.
+            amplitude = 0.05 * (node + 1) ** 3
+            payloads = worker.handle_window(_window(node, now, amplitude=amplitude)) or payloads
+
+        assert len(payloads) == settings.NUM_NODES
+
+        embeddings = {tuple(p["gnn_embedding"]) for p in payloads}
+        assert len(embeddings) == settings.NUM_NODES, "every node must get its own embedding"
+
+        forecasts = {p["ttf_prediction"] for p in payloads}
+        assert len(forecasts) > 1, "forecasts must not be one pooled number copied N times"
+
+    def test_degraded_array_still_emits_telemetry(self, worker, override_settings):
+        """End to end: a dead microphone must not stop the other three."""
+        override_settings(ARRAY_MAX_WAIT=0.0, ARRAY_MIN_NODES=2)
+        worker.assembler = WindowAssembler(
+            num_nodes=settings.NUM_NODES,
+            seq_length=8,
+            n_mels=settings.N_MELS,
+            max_wait=0.0,
+            min_nodes=2,
+        )
+
+        now = time.time()
+        payloads: list[dict] = []
+        for node in range(settings.NUM_NODES - 1):
+            payloads = worker.handle_window(_window(node, now)) or payloads
+
+        reporting = {p["node_id"] for p in payloads}
+        assert reporting == set(range(settings.NUM_NODES - 1))
+        assert settings.NUM_NODES - 1 not in reporting
 
     def test_submit_survives_unreachable_api(self):
         w = InferenceWorker(inference_url="http://127.0.0.1:1", load_weights=False)

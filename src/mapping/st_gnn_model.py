@@ -20,11 +20,28 @@ entire reason for choosing that architecture.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, global_mean_pool
+
+# Distinct (num_graphs, device, num_edges) combinations worth keeping. Training
+# sees at most two (a full batch and the final short one); a serving process
+# sees one.
+_EDGE_CACHE_MAX_ENTRIES = 32
+
+
+@dataclass
+class _CachedTopology:
+    """A batched topology plus the tensors it was derived from."""
+
+    source_index: torch.Tensor
+    source_weight: torch.Tensor | None
+    batched_index: torch.Tensor
+    batched_weight: torch.Tensor | None
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -209,7 +226,14 @@ class SpatioTemporalGNN(nn.Module):
         # arithmetic that depends only on (num_graphs, device). Recomputing it
         # every forward pass — as the previous implementation did, with a Python
         # loop and a host-to-device copy — is wasted work on the hot path.
-        self._edge_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor | None]] = {}
+        # Keyed on shape, not on tensor addresses. An earlier version keyed on
+        # ``data_ptr()``, which is only unique while the tensor is alive: once a
+        # topology tensor is freed the allocator may hand the same address to a
+        # different one, and the cache would then return a batched topology
+        # belonging to a graph that no longer exists. The entry therefore holds a
+        # reference to the source tensors and confirms identity on hit — the
+        # reference also keeps the address from being recycled in the first place.
+        self._edge_cache: OrderedDict[tuple, _CachedTopology] = OrderedDict()
 
     def _batched_topology(
         self,
@@ -219,31 +243,39 @@ class SpatioTemporalGNN(nn.Module):
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Replicate the topology across ``num_graphs`` disjoint graphs."""
-        key = (
-            num_graphs,
-            str(device),
-            int(edge_index.shape[1]),
-            edge_index.data_ptr(),
-            None if edge_weight is None else edge_weight.data_ptr(),
-        )
-        cached = self._edge_cache.get(key)
-        if cached is not None:
-            return cached
+        key = (num_graphs, str(device), int(edge_index.shape[1]))
 
-        edge_index = edge_index.to(device)
+        cached = self._edge_cache.get(key)
+        if (
+            cached is not None
+            and cached.source_index is edge_index
+            and cached.source_weight is edge_weight
+        ):
+            self._edge_cache.move_to_end(key)
+            return cached.batched_index, cached.batched_weight
+
+        device_index = edge_index.to(device)
         # (2, E) -> (G, 2, E) via broadcast offsets -> (2, G*E)
         offsets = (torch.arange(num_graphs, device=device) * self.num_nodes).view(-1, 1, 1)
-        batched_index = (edge_index.unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, -1)
+        batched_index = (device_index.unsqueeze(0) + offsets).permute(1, 0, 2).reshape(2, -1)
 
         batched_weight = None
         if edge_weight is not None:
             batched_weight = edge_weight.to(device).repeat(num_graphs)
 
-        # Bounded so a service that sees many distinct batch sizes cannot grow
-        # this without limit.
-        if len(self._edge_cache) > 32:
-            self._edge_cache.clear()
-        self._edge_cache[key] = (batched_index, batched_weight)
+        self._edge_cache[key] = _CachedTopology(
+            source_index=edge_index,
+            source_weight=edge_weight,
+            batched_index=batched_index,
+            batched_weight=batched_weight,
+        )
+        self._edge_cache.move_to_end(key)
+        # Least-recently-used eviction. Flushing the whole cache on overflow —
+        # as this previously did — throws away the hot entry the training loop
+        # is about to ask for again, so a service that occasionally sees an odd
+        # batch size pays a full rebuild on the very next step.
+        while len(self._edge_cache) > _EDGE_CACHE_MAX_ENTRIES:
+            self._edge_cache.popitem(last=False)
         return batched_index, batched_weight
 
     def forward(
@@ -252,7 +284,8 @@ class SpatioTemporalGNN(nn.Module):
         edge_index: torch.Tensor,
         edge_weight: torch.Tensor | None = None,
         return_sequence: bool = False,
-    ) -> torch.Tensor:
+        return_nodes: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
@@ -267,10 +300,23 @@ class SpatioTemporalGNN(nn.Module):
             When ``True``, return a per-timestep embedding sequence
             ``(B, S, embedding_dim)`` for continuous-time consumers. When
             ``False``, mean-pool over time to a single ``(B, embedding_dim)``.
+        return_nodes:
+            Also return per-node embeddings ``(B, S, num_nodes, embedding_dim)``.
+            The graph readout pools the array into one vector, so a forecast
+            derived from it describes the *facility*; anything presented to an
+            operator as a per-machine reading has to come from this instead.
 
         Returns
         -------
-        ``(B, embedding_dim)`` or ``(B, S, embedding_dim)``.
+        ``(B, embedding_dim)`` or ``(B, S, embedding_dim)``, or a
+        ``(graph, nodes)`` pair when ``return_nodes`` is set.
+
+        Cost note
+        ---------
+        The spatial GCN runs over ``B * S`` disjoint graphs — one per timestep
+        rather than one per sample. That is what makes the spatial convolution
+        time-resolved, and it is the dominant term in training cost: a batch of
+        16 over a 50-step window convolves 800 graphs per forward pass.
         """
         if x.dim() == 3:
             B, S, flat = x.shape
@@ -317,9 +363,15 @@ class SpatioTemporalGNN(nn.Module):
         pooled = global_mean_pool(h, batch_vec)  # (B*S, hidden)
         embeddings = self.readout(pooled).view(B, S, self.embedding_dim)
 
-        if return_sequence:
-            return embeddings
-        return embeddings.mean(dim=1)
+        graph_out = embeddings if return_sequence else embeddings.mean(dim=1)
+        if not return_nodes:
+            return graph_out
+
+        # The same readout applied before pooling, so each microphone keeps its
+        # own trajectory through the graph. h is laid out (B, S, N, hidden) by
+        # the permute in stage 2, so this view preserves node ordering.
+        node_embeddings = self.readout(h).view(B, S, N, self.embedding_dim)
+        return graph_out, node_embeddings
 
 
 def main() -> None:  # pragma: no cover - manual inspection helper

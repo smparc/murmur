@@ -68,6 +68,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # opening the page mid-shift sees context instead of a blank screen.
 REPLAY_BUFFER_SIZE = 50
 
+# How often idle rate-limit buckets are reclaimed. Well under the 60s window, so
+# a bucket is normally gone within one sweep of expiring.
+RATE_SWEEP_INTERVAL_SECONDS = 30.0
+
 # Sending to a wedged client must not stall the broadcast path.
 WS_SEND_TIMEOUT_SECONDS = 5.0
 
@@ -211,12 +215,41 @@ class _AppState:
         # exists (every TestClient instance creates one).
         self._ws_lock: asyncio.Lock | None = None
         self._rate_buckets: dict[str, deque[float]] = defaultdict(deque)
+        self._last_sweep: float = 0.0
 
     @property
     def ws_lock(self) -> asyncio.Lock:
         if self._ws_lock is None:
             self._ws_lock = asyncio.Lock()
         return self._ws_lock
+
+    def sweep_rate_buckets(self, now: float, force: bool = False) -> None:
+        """
+        Discard rate-limit buckets that no longer constrain anyone.
+
+        Each bucket is trimmed of expired hits when its own key is seen again,
+        but a key that is never seen again is never trimmed. The map is keyed by
+        API key or client address — both attacker-controlled on a public
+        endpoint — so without this the limiter itself becomes the memory
+        exhaustion vector it was added to prevent: one request per spoofed
+        source grows it without bound.
+        """
+        if not force and now - self._last_sweep < RATE_SWEEP_INTERVAL_SECONDS:
+            return
+        self._last_sweep = now
+
+        for key in [k for k, b in self._rate_buckets.items() if not b or now - b[-1] > 60.0]:
+            del self._rate_buckets[key]
+
+        # A single burst can introduce more distinct keys than the sweep window
+        # would ever reclaim, so the map is also hard-capped. Evicting the least
+        # recently active is the safe direction: the worst case is that a caller
+        # who has been idle gets a fresh allowance.
+        excess = len(self._rate_buckets) - settings.RATE_LIMIT_MAX_KEYS
+        if excess > 0:
+            by_age = sorted(self._rate_buckets, key=lambda k: self._rate_buckets[k][-1])
+            for key in by_age[:excess]:
+                del self._rate_buckets[key]
 
 
 state = _AppState()
@@ -254,6 +287,16 @@ def enforce_rate_limit(request: Request) -> None:
 
     key = request.headers.get("x-api-key") or (request.client.host if request.client else "unknown")
     now = time.monotonic()
+
+    # Sweep on a timer, and force one whenever an unseen key would push the map
+    # past its cap, so the bound holds continuously rather than only just after
+    # a periodic sweep.
+    state.sweep_rate_buckets(
+        now,
+        force=key not in state._rate_buckets
+        and len(state._rate_buckets) >= settings.RATE_LIMIT_MAX_KEYS,
+    )
+
     bucket = state._rate_buckets[key]
     while bucket and now - bucket[0] > 60.0:
         bucket.popleft()
@@ -447,20 +490,31 @@ def _template_telemetry(request: TelemetryRequest) -> str:
 @torch.no_grad()
 def _generate_text(request: TelemetryRequest) -> tuple[str, bool]:
     """Returns ``(text, generated_by_llm)``."""
+    # Bind the models once, up front. This runs on a worker thread via
+    # asyncio.to_thread, and shutdown clears these attributes without waiting
+    # for in-flight generations — so re-reading state part-way through can find
+    # None and surface as a 500 on a request that was accepted while healthy.
+    projector = state.projector
+    llm_model = state.llm_model
+    tokenizer = state.tokenizer
+
+    if projector is None:
+        raise RuntimeError("Projector unloaded — server is shutting down")
+
     embedding = torch.tensor([request.gnn_embedding], dtype=torch.float32, device=DEVICE)
 
     with track_inference("embedding_projector"):
-        acoustic_embeds = state.projector(embedding)
+        acoustic_embeds = projector(embedding)
 
-    if state.llm_model is None or state.tokenizer is None:
+    if llm_model is None or tokenizer is None:
         return _template_telemetry(request), False
 
-    target_dtype = state.llm_model.get_input_embeddings().weight.dtype
+    target_dtype = llm_model.get_input_embeddings().weight.dtype
     acoustic_embeds = acoustic_embeds.to(target_dtype)
 
     prompt = _build_prompt(request)
-    inputs = state.tokenizer(prompt, return_tensors="pt").to(state.llm_model.device)
-    text_embeds = state.llm_model.get_input_embeddings()(inputs.input_ids)
+    inputs = tokenizer(prompt, return_tensors="pt").to(llm_model.device)
+    text_embeds = llm_model.get_input_embeddings()(inputs.input_ids)
 
     combined = torch.cat([text_embeds, acoustic_embeds.unsqueeze(1).to(text_embeds.device)], dim=1)
     # Every position is real; an explicit mask silences the transformers warning
@@ -468,17 +522,17 @@ def _generate_text(request: TelemetryRequest) -> tuple[str, bool]:
     attention_mask = torch.ones(combined.shape[:2], dtype=torch.long, device=combined.device)
 
     with track_inference("llm_generation"):
-        outputs = state.llm_model.generate(
+        outputs = llm_model.generate(
             inputs_embeds=combined,
             attention_mask=attention_mask,
             max_new_tokens=settings.LLM_MAX_NEW_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
             do_sample=settings.LLM_TEMPERATURE > 0,
-            pad_token_id=state.tokenizer.eos_token_id or state.tokenizer.pad_token_id,
+            pad_token_id=tokenizer.eos_token_id or tokenizer.pad_token_id,
         )
 
     # With inputs_embeds, generate() returns only the newly generated tokens.
-    return state.tokenizer.decode(outputs[0], skip_special_tokens=True).strip(), True
+    return tokenizer.decode(outputs[0], skip_special_tokens=True).strip(), True
 
 
 @app.post(
@@ -539,7 +593,29 @@ async def generate_telemetry(request: TelemetryRequest) -> TelemetryResponse:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/metrics")
+def require_metrics_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
+    """
+    Gate ``/metrics`` behind the same key as writes.
+
+    The exposition carries per-node anomaly counts, z-scores and TTF forecasts —
+    a live map of which machines in the plant are failing. On a LoadBalancer
+    Service that is public. ``/health`` and ``/ready`` stay open because
+    kubelet probes cannot present credentials, and neither carries per-node data.
+
+    Set ``METRICS_REQUIRE_AUTH=false`` for an in-cluster Prometheus that scrapes
+    without a key.
+    """
+    if not settings.AUTH_ENABLED or not settings.METRICS_REQUIRE_AUTH:
+        return
+    if x_api_key != settings.API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-API-Key",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+
+@app.get("/metrics", dependencies=[Depends(require_metrics_key)])
 async def metrics() -> PlainTextResponse:
     return PlainTextResponse(render().decode("utf-8"), media_type=CONTENT_TYPE)
 

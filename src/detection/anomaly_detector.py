@@ -36,6 +36,11 @@ Severity = Literal["normal", "warning", "critical"]
 # the robust z-score directly comparable to a conventional standard-deviation z.
 _MAD_TO_SIGMA = 0.6745
 
+# Reported when the rolling baseline has no spread at all. Comfortably above
+# twice any sane ANOMALY_Z_THRESHOLD, so it classifies as critical, while
+# staying a number a human can read on a dashboard.
+_DEGENERATE_Z = 10.0
+
 
 # ---------------------------------------------------------------------------
 # Autoencoder
@@ -264,11 +269,20 @@ class AnomalyScorer:
         if std > 1e-12:
             return (value - mean) / std, median
 
-        # Degenerate baseline: every observation so far is identical. Any
-        # departure at all is meaningful; an identical value is not.
+        # Degenerate baseline: every observation so far is identical, so there
+        # is no scale to measure a departure against. That a departure happened
+        # is meaningful; its magnitude is not, because the ratio is taken
+        # against an arbitrarily small median and can be astronomically large.
+        #
+        # Saturating at a fixed, unambiguously-critical value keeps that from
+        # reaching a Prometheus gauge and an LLM prompt as a z-score of 40,000 —
+        # a number an operator cannot interpret and a model will happily narrate.
+        # Sign is preserved: a channel that went quiet is not a fault.
         scale = max(abs(median), 1e-9)
         relative = (value - median) / scale
-        return (relative * 1e3 if abs(relative) > 1e-9 else 0.0), median
+        if abs(relative) <= 1e-9:
+            return 0.0, median
+        return math.copysign(_DEGENERATE_Z, relative), median
 
     def _severity(self, z: float) -> Severity:
         if z >= 2.0 * self.z_threshold:
