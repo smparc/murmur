@@ -4,26 +4,36 @@ import time
 
 import pytest
 
-# Skip this entire module if Kafka is not available
+from src.settings import settings
+
+# Skip this entire module if the client library is not installed at all.
 pytest.importorskip("confluent_kafka")
 
 
 @pytest.fixture
-def kafka_available():
-    """Check if Kafka broker is reachable."""
-    from confluent_kafka import Producer
+def broker() -> str:
+    """
+    Probe the broker for real, and skip if it is not there.
 
+    Constructing a ``Producer`` does not connect — librdkafka dials lazily — and
+    ``flush()`` on an empty queue returns 0 whether or not a broker exists. So
+    the previous version of this fixture always reported "available", and the
+    test then failed on a missing message rather than skipping. ``list_topics``
+    performs an actual metadata round trip, which is the thing being asked.
+    """
+    from confluent_kafka import KafkaException, Producer
+
+    address = settings.KAFKA_BROKER
     try:
-        p = Producer({"bootstrap.servers": "localhost:9092"})
-        p.flush(timeout=2)
-        return True
-    except Exception:
-        pytest.skip("Kafka broker not available")
+        Producer({"bootstrap.servers": address}).list_topics(timeout=3)
+    except KafkaException:
+        pytest.skip(f"No Kafka broker at {address}")
+    return address
 
 
 class TestKafkaPipeline:
     @pytest.mark.integration
-    def test_produce_and_consume_roundtrip(self, kafka_available):
+    def test_produce_and_consume_roundtrip(self, broker):
         """Verify a message can roundtrip through Kafka."""
         import msgpack
         from confluent_kafka import Consumer, Producer
@@ -32,14 +42,14 @@ class TestKafkaPipeline:
         test_payload = msgpack.packb({"test": True, "ts": time.time()}, use_bin_type=True)
 
         # Produce
-        producer = Producer({"bootstrap.servers": "localhost:9092"})
+        producer = Producer({"bootstrap.servers": broker})
         producer.produce(topic, value=test_payload)
         producer.flush(timeout=5)
 
         # Consume
         consumer = Consumer(
             {
-                "bootstrap.servers": "localhost:9092",
+                "bootstrap.servers": broker,
                 "group.id": "test-group",
                 "auto.offset.reset": "earliest",
             }
