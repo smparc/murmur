@@ -47,7 +47,11 @@ from src.mapping.st_gnn_model import SpatioTemporalGNN
 from src.mapping.tdoa import TDOAEstimate, tdoa_edge_weights
 from src.mapping.topology_graph import build_acoustic_topology
 from src.observability.metrics import (
+    ARRAY_NODES_REPORTING,
+    NODE_DROPPED,
     PIPELINE_ERRORS,
+    SNAPSHOTS_EMITTED,
+    TELEMETRY_DROPPED,
     record_consumer_lag,
     track_inference,
     track_stage,
@@ -82,6 +86,20 @@ class WindowAssembler:
     once every node has reported within ``staleness_tolerance`` seconds of the
     newest arrival, so the GCN always sees a coherent instant rather than
     stitching together frames minutes apart.
+
+    Degraded release
+    ----------------
+    Requiring the full array unconditionally means a single dead microphone
+    stalls the assembler forever: the remaining nodes stream indefinitely and
+    nothing is ever emitted. On a system whose entire purpose is not missing
+    events, going silent is the worst available failure mode — it is visually
+    identical to a healthy, quiet plant.
+
+    So after ``max_wait`` seconds the snapshot is released without the absent
+    microphones, provided at least ``min_nodes`` are still reporting. Absent
+    nodes are zero-filled in the tensor (the graph keeps a fixed shape so the
+    topology stays aligned) and omitted from the returned snapshot, so no
+    telemetry is fabricated for a microphone that said nothing.
     """
 
     def __init__(
@@ -89,26 +107,101 @@ class WindowAssembler:
         num_nodes: int,
         seq_length: int,
         n_mels: int,
-        staleness_tolerance: float = 5.0,
+        staleness_tolerance: float | None = None,
+        max_wait: float | None = None,
+        min_nodes: int | None = None,
     ):
         self.num_nodes = num_nodes
         self.seq_length = seq_length
         self.n_mels = n_mels
-        self.staleness_tolerance = staleness_tolerance
+        self.staleness_tolerance = (
+            settings.WINDOW_STALENESS_TOLERANCE
+            if staleness_tolerance is None
+            else staleness_tolerance
+        )
+        self.max_wait = settings.ARRAY_MAX_WAIT if max_wait is None else max_wait
+        self.min_nodes = settings.ARRAY_MIN_NODES if min_nodes is None else min_nodes
         self._windows: dict[int, NodeWindow] = {}
+        self._cycle_started: float | None = None
+        # Reported once per node rather than per frame: a permanently misconfigured
+        # SEQ_LENGTH would otherwise emit an error for every window forever.
+        self._bad_shape_logged: set[int] = set()
+        self.last_missing: set[int] = set()
 
-    def push(self, window: NodeWindow) -> None:
+    def push(self, window: NodeWindow) -> bool:
+        """
+        Buffer one node's window. Returns False if it was rejected.
+
+        A window whose sequence length disagrees with ``seq_length`` cannot be
+        reshaped into the graph tensor. Rejecting it here, loudly and once,
+        beats letting ``assemble`` raise on every subsequent snapshot — that
+        turns a fixable configuration error into an unbounded error log.
+        """
+        actual = window.features.shape[0]
+        if actual != self.seq_length:
+            if window.node_id not in self._bad_shape_logged:
+                self._bad_shape_logged.add(window.node_id)
+                log.error(
+                    "Node %s sent a %d-step window but SEQ_LENGTH is %d. The ingestion "
+                    "service and the worker disagree on window length; align SEQ_LENGTH "
+                    "across both. Further windows from this node are dropped silently.",
+                    window.node_id,
+                    actual,
+                    self.seq_length,
+                )
+            PIPELINE_ERRORS.labels(stage="window_shape").inc()
+            return False
+
+        if not self._windows:
+            self._cycle_started = time.monotonic()
         self._windows[window.node_id] = window
+        return True
 
-    def is_complete(self) -> bool:
-        """True when every node has a window and none is stale."""
-        if len(self._windows) < self.num_nodes:
-            return False
-        if not all(i in self._windows for i in range(self.num_nodes)):
-            return False
+    def _fresh_nodes(self) -> set[int]:
+        """Nodes whose window falls inside the staleness bound of the newest."""
+        if not self._windows:
+            return set()
         newest = max(w.timestamp for w in self._windows.values())
-        oldest = min(w.timestamp for w in self._windows.values())
-        return (newest - oldest) <= self.staleness_tolerance
+        return {
+            node_id
+            for node_id, w in self._windows.items()
+            if newest - w.timestamp <= self.staleness_tolerance
+        }
+
+    def _evict_stale(self) -> None:
+        """
+        Drop windows that fell outside the staleness bound.
+
+        Without this a node that stops reporting keeps its last window in the
+        buffer forever, and the spread between newest and oldest never returns
+        below tolerance — so even the surviving microphones stop producing.
+        """
+        fresh = self._fresh_nodes()
+        for node_id in [n for n in self._windows if n not in fresh]:
+            del self._windows[node_id]
+            NODE_DROPPED.labels(node_id=str(node_id)).inc()
+            log.warning(
+                "Node %s exceeded the %.1fs staleness bound and was evicted from the "
+                "current snapshot; the array is now running degraded.",
+                node_id,
+                self.staleness_tolerance,
+            )
+
+    def is_complete(self, now: float | None = None) -> bool:
+        """
+        True when the snapshot is ready — either whole, or degraded past
+        ``max_wait`` with a quorum still reporting.
+        """
+        self._evict_stale()
+        if not self._windows:
+            return False
+
+        if len(self._windows) == self.num_nodes:
+            return True
+
+        now = time.monotonic() if now is None else now
+        waited = now - (self._cycle_started or now)
+        return waited >= self.max_wait and len(self._windows) >= self.min_nodes
 
     def assemble(self) -> tuple[torch.Tensor, torch.Tensor, dict[int, NodeWindow]]:
         """
@@ -116,19 +209,29 @@ class WindowAssembler:
 
         Returns ``(x, timespans, windows)`` where ``x`` is
         ``(1, seq_len, num_nodes * n_mels)`` and ``timespans`` is
-        ``(1, seq_len)``.
+        ``(1, seq_len)``. ``windows`` contains only the nodes that actually
+        reported; absent nodes are zero-filled in ``x`` so the tensor keeps the
+        fixed shape the topology is indexed against.
         """
-        ordered = [self._windows[i] for i in range(self.num_nodes)]
+        present = [self._windows.get(i) for i in range(self.num_nodes)]
+        self.last_missing = {i for i, w in enumerate(present) if w is None}
 
+        silence = np.zeros((self.seq_length, self.n_mels), dtype=np.float32)
+        stacked = np.stack([silence if w is None else w.features for w in present], axis=0)
         # (num_nodes, seq, mels) -> (seq, num_nodes, mels) -> (seq, nodes*mels)
-        stacked = np.stack([w.features for w in ordered], axis=0)
         interleaved = stacked.transpose(1, 0, 2).reshape(self.seq_length, -1)
 
-        x = torch.from_numpy(interleaved).float().unsqueeze(0)
+        x = torch.from_numpy(np.ascontiguousarray(interleaved)).float().unsqueeze(0)
+
         # Nodes share a clock closely enough that the mean interval is the right
-        # integration step for the graph-level sequence.
+        # integration step for the graph-level sequence. Absent nodes contribute
+        # no interval — averaging in zeros would compress the LNN's time axis and
+        # silently shorten every forecast horizon.
+        reporting = [w for w in present if w is not None]
         timespans = (
-            torch.from_numpy(np.mean([w.timespans for w in ordered], axis=0)).float().unsqueeze(0)
+            torch.from_numpy(np.mean([w.timespans for w in reporting], axis=0))
+            .float()
+            .unsqueeze(0)
         )
 
         snapshot = dict(self._windows)
@@ -136,6 +239,7 @@ class WindowAssembler:
 
     def clear(self) -> None:
         self._windows.clear()
+        self._cycle_started = None
 
 
 def decode_window(raw: bytes) -> NodeWindow | None:
