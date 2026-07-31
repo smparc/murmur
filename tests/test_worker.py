@@ -133,8 +133,8 @@ class TestDecodeWindow:
 
 
 @pytest.fixture
-def worker(api_client, monkeypatch):
-    monkeypatch.setattr(settings, "SEQ_LENGTH", 8)
+def worker(api_client, override_settings):
+    override_settings(SEQ_LENGTH=8)
     w = InferenceWorker(
         inference_url="http://testserver", http_client=api_client, load_weights=False
     )
@@ -195,7 +195,7 @@ class TestInferenceWorker:
         for payload in payloads:
             assert api_client.post("/generate_telemetry", json=payload).status_code == 200
 
-    def test_submit_survives_unreachable_api(self, monkeypatch):
+    def test_submit_survives_unreachable_api(self):
         w = InferenceWorker(
             inference_url="http://127.0.0.1:1", load_weights=False
         )

@@ -31,6 +31,33 @@ def _deterministic():
 
 
 @pytest.fixture
+def override_settings():
+    """
+    Temporarily override fields on the global settings object.
+
+    ``Settings`` is a frozen dataclass — configuration should not mutate at
+    runtime — so tests reach past that deliberately and restore afterwards
+    rather than the production type being loosened for their convenience.
+    """
+    from src.settings import settings as live
+
+    originals: dict[str, object] = {}
+
+    def _apply(**overrides):
+        for name, value in overrides.items():
+            if not hasattr(live, name):
+                raise AttributeError(f"Settings has no field {name!r}")
+            originals.setdefault(name, getattr(live, name))
+            object.__setattr__(live, name, value)
+        return live
+
+    yield _apply
+
+    for name, value in originals.items():
+        object.__setattr__(live, name, value)
+
+
+@pytest.fixture
 def device() -> torch.device:
     return torch.device("cpu")
 

@@ -318,6 +318,12 @@ async def lifespan(app: FastAPI):
             await ws.close(code=status.WS_1001_GOING_AWAY)
     ACTIVE_WS_CLIENTS.set(0)
 
+    # Drop buffered telemetry: after a restart the resident models may differ,
+    # and replaying pre-restart frames to a reconnecting dashboard would
+    # present them as current readings.
+    state.replay.clear()
+    state._rate_buckets.clear()
+
     state.llm_model = state.projector = state.tokenizer = None
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

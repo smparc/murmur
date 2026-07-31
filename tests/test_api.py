@@ -124,10 +124,10 @@ class TestWebSocket:
 
 class TestAuth:
     @pytest.fixture
-    def secured_client(self, monkeypatch):
+    def secured_client(self, override_settings):
         from fastapi.testclient import TestClient
 
-        monkeypatch.setattr(settings, "API_KEY", "test-key")
+        override_settings(API_KEY="test-key")
         from src.translation.llm_decoder import app
 
         with TestClient(app) as client:
@@ -154,8 +154,8 @@ class TestAuth:
 
 
 class TestRateLimit:
-    def test_burst_beyond_limit_is_throttled(self, api_client, monkeypatch):
-        monkeypatch.setattr(settings, "RATE_LIMIT_PER_MINUTE", 5)
+    def test_burst_beyond_limit_is_throttled(self, api_client, override_settings):
+        override_settings(RATE_LIMIT_PER_MINUTE=5)
         from src.translation.llm_decoder import state
 
         state._rate_buckets.clear()
