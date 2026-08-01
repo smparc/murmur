@@ -87,9 +87,7 @@ class _BaseDataset:
         self.root = Path(root)
         self.sample_rate = sample_rate
         if not self.root.exists():
-            raise DatasetNotFound(
-                f"{self.name} not found at {self.root}\n\n{self.download_hint}"
-            )
+            raise DatasetNotFound(f"{self.name} not found at {self.root}\n\n{self.download_hint}")
 
     def iter_samples(self) -> Iterator[AudioSample]:
         raise NotImplementedError

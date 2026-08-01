@@ -122,9 +122,7 @@ class TestWavLoading:
     def test_multichannel_is_mixed_to_mono(self, tmp_path):
         path = tmp_path / "fan" / "id_00" / "normal" / "a.wav"
         path.parent.mkdir(parents=True)
-        stereo = np.stack(
-            [np.full(64, 0.5, np.float32), np.full(64, -0.1, np.float32)], axis=1
-        )
+        stereo = np.stack([np.full(64, 0.5, np.float32), np.full(64, -0.1, np.float32)], axis=1)
         wavfile.write(path, 16_000, stereo)
 
         dataset = MIMIIDataset(tmp_path)

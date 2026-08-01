@@ -167,8 +167,10 @@ class SlackSink(AlertSink):
     _COLOURS = {"critical": "#dc2626", "warning": "#f59e0b", "normal": "#10b981"}
 
     def format(self, alert: Alert) -> dict:
-        colour = self._COLOURS["normal"] if alert.resolved else self._COLOURS.get(
-            alert.severity, "#6b7280"
+        colour = (
+            self._COLOURS["normal"]
+            if alert.resolved
+            else self._COLOURS.get(alert.severity, "#6b7280")
         )
         return {
             "text": alert.title,
@@ -204,7 +206,9 @@ class PagerDutySink(AlertSink):
     _SEVERITY = {"critical": "critical", "warning": "warning", "normal": "info"}
 
     def __init__(
-        self, routing_key: str, url: str = "https://events.pagerduty.com/v2/enqueue",
+        self,
+        routing_key: str,
+        url: str = "https://events.pagerduty.com/v2/enqueue",
         transport: Transport = urllib_transport,
     ):
         super().__init__(url, transport)

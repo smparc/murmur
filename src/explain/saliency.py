@@ -92,6 +92,7 @@ class BandContribution:
 
     def describe(self) -> str:
         """Short human-readable label, e.g. ``"2.1-3.4 kHz (46%)"``."""
+
         def fmt(hz: float) -> str:
             return f"{hz / 1000:.1f} kHz" if hz >= 1000 else f"{hz:.0f} Hz"
 

@@ -41,6 +41,7 @@ import numpy as np
 import torch
 
 from src.detection.anomaly_detector import AnomalyScorer, ScoreResult, SpectrogramAutoencoder
+from src.explain.saliency import explain_anomaly
 from src.forecasting.conformal import ConformalCalibrator, severity_bucket
 from src.forecasting.liquid_network import AcousticForecastingLNN
 from src.mapping.st_gnn_model import SpatioTemporalGNN
@@ -57,6 +58,7 @@ from src.observability.metrics import (
     track_stage,
 )
 from src.settings import settings
+from src.translation.taxonomy import FaultTaxonomy
 
 log = logging.getLogger(__name__)
 
@@ -348,6 +350,11 @@ class InferenceWorker:
 
         self.calibrator = self._load_calibrator()
 
+        # Spectral attribution and catalogue matching. Both are cheap relative to
+        # the model chain but not free, so they run only for frames that actually
+        # flagged — see infer().
+        self.taxonomy = FaultTaxonomy()
+
         self._client = http_client or httpx.Client(timeout=30.0)
         self._owns_client = http_client is None
         self._throttled = 0
@@ -519,8 +526,38 @@ class InferenceWorker:
                 payload["ttf_interval"] = interval
             if source_position is not None:
                 payload["source_position"] = source_position
+
+            explanation = self._explain(frame, result)
+            if explanation is not None:
+                payload["explanation"] = explanation.as_dict()
+                payload["diagnosis"] = self.taxonomy.best(explanation).as_dict()
+
             payloads.append(payload)
         return payloads
+
+    def _explain(self, frame: torch.Tensor, result: ScoreResult):
+        """
+        Attribute a flagged frame's score across frequency bands.
+
+        Only for frames that actually flagged, and only when a trained
+        autoencoder is resident. The attribution is an exact decomposition of the
+        reconstruction error, so without that autoencoder there is no error map
+        to decompose — the scorer is falling back to frame energy and any
+        "explanation" would be invented.
+
+        Restricting this to anomalies keeps a per-node autoencoder forward off
+        the steady-state path, where the overwhelming majority of frames are
+        normal and nobody reads the attribution.
+        """
+        if not (result.is_anomaly and self.weights_loaded):
+            return None
+        try:
+            return explain_anomaly(self.autoencoder, frame.to(DEVICE), settings.SAMPLE_RATE)
+        except Exception:
+            # An alert with no attribution is worth strictly more than no alert.
+            PIPELINE_ERRORS.labels(stage="explain").inc()
+            log.warning("Could not attribute anomaly score", exc_info=True)
+            return None
 
     def submit(self, payload: dict) -> bool:
         """POST one payload to the telemetry API."""

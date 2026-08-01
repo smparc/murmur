@@ -47,7 +47,7 @@ class TimingResult:
         if not self.samples_ms:
             return 0.0
         ordered = sorted(self.samples_ms)
-        index = min(len(ordered) - 1, int(round(pct / 100.0 * (len(ordered) - 1))))
+        index = min(len(ordered) - 1, round(pct / 100.0 * (len(ordered) - 1)))
         return ordered[index]
 
     @property
@@ -182,9 +182,7 @@ def benchmark_preprocessing(iterations: int = 100) -> dict[str, TimingResult]:
             # Without this the timer measures kernel *launch*, not execution.
             torch.cuda.synchronize()
 
-        results["preprocess_cuda"] = time_it(
-            "mel spectrogram (cuda)", run_cuda, iterations
-        )
+        results["preprocess_cuda"] = time_it("mel spectrogram (cuda)", run_cuda, iterations)
 
     return results
 
@@ -231,9 +229,7 @@ def benchmark_localization(iterations: int = 50) -> dict[str, TimingResult]:
     channels = rng.normal(0, 0.2, (len(mics), settings.SAMPLES_PER_CHUNK)).astype(np.float64)
 
     def solve() -> None:
-        estimates = pairwise_tdoa(
-            channels, mics, settings.SAMPLE_RATE, interp=settings.TDOA_INTERP
-        )
+        estimates = pairwise_tdoa(channels, mics, settings.SAMPLE_RATE, interp=settings.TDOA_INTERP)
         localize_source(estimates, mics)
 
     return {
@@ -259,8 +255,7 @@ def benchmark_throughput_by_nodes(
     results: dict[str, TimingResult] = {}
     for count in node_counts:
         audio = [
-            rng.normal(0, 0.2, settings.SAMPLES_PER_CHUNK).astype(np.float32)
-            for _ in range(count)
+            rng.normal(0, 0.2, settings.SAMPLES_PER_CHUNK).astype(np.float32) for _ in range(count)
         ]
         scorer = AnomalyScorer(autoencoder=autoencoder, num_nodes=count, warmup_frames=1)
 
@@ -311,8 +306,7 @@ def run_all(iterations: int = 200) -> dict:
         else 0.0
     )
     size_ratio = (
-        serialization["json_encode"].payload_bytes
-        / serialization["msgpack_encode"].payload_bytes
+        serialization["json_encode"].payload_bytes / serialization["msgpack_encode"].payload_bytes
         if serialization["msgpack_encode"].payload_bytes
         else 0.0
     )

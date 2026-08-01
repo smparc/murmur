@@ -115,9 +115,7 @@ class Scenario:
 
     def events_for(self, node_id: int) -> list[tuple[int, int]]:
         """``(onset, failure)`` pairs for one node, for the lead-time metrics."""
-        return [
-            (e.onset_frame, e.failure_frame) for e in self.events if e.node_id == node_id
-        ]
+        return [(e.onset_frame, e.failure_frame) for e in self.events if e.node_id == node_id]
 
     @property
     def duration_s(self) -> float:

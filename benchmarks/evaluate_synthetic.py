@@ -113,9 +113,7 @@ def evaluate(
     merged_events: list[tuple[int, int]] = []
     cursor = 0
     for node_id, bucket in per_node.items():
-        for onset, failure in _rebase_events(
-            scenario.events_for(node_id), bucket["frame_indices"]
-        ):
+        for onset, failure in _rebase_events(scenario.events_for(node_id), bucket["frame_indices"]):
             merged_events.append((cursor + onset, cursor + failure))
         cursor += len(bucket["scores"])
 

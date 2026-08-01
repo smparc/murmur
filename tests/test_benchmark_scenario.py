@@ -60,14 +60,17 @@ class TestGeneration:
         b = generate_scenario(config)
 
         assert [e.onset_frame for e in a.events] == [e.onset_frame for e in b.events]
-        for fa, fb in zip(a.frames, b.frames):
+        for fa, fb in zip(a.frames, b.frames, strict=True):
             assert np.array_equal(fa.audio, fb.audio)
 
     def test_different_seeds_diverge(self):
         base = ScenarioConfig(num_nodes=2, frames_per_node=40, min_onset_frame=10, seed=1)
         other = ScenarioConfig(num_nodes=2, frames_per_node=40, min_onset_frame=10, seed=2)
         a, b = generate_scenario(base), generate_scenario(other)
-        assert any(not np.array_equal(fa.audio, fb.audio) for fa, fb in zip(a.frames, b.frames))
+        assert any(
+            not np.array_equal(fa.audio, fb.audio)
+            for fa, fb in zip(a.frames, b.frames, strict=True)
+        )
 
     def test_generation_does_not_leak_numpy_global_seed(self):
         # The generator seeds numpy to stay deterministic; it must put the

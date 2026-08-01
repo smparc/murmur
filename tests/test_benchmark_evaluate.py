@@ -25,9 +25,7 @@ def tiny_dcase(tmp_path):
 
     def write(path, amplitude):
         path.parent.mkdir(parents=True, exist_ok=True)
-        wavfile.write(
-            path, 16_000, rng.normal(0, amplitude, 8_000).astype(np.float32)
-        )
+        wavfile.write(path, 16_000, rng.normal(0, amplitude, 8_000).astype(np.float32))
 
     for i in range(10):
         write(root / "fan" / "train" / f"normal_id_00_{i:08d}.wav", 0.05)

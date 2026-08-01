@@ -84,9 +84,7 @@ class TestSerializationBenchmark:
         # Structural, not a timing claim: JSON has to render every float as
         # decimal text, which cannot be smaller than the raw buffer.
         results = benchmark_serialization(iterations=5)
-        assert (
-            results["msgpack_encode"].payload_bytes < results["json_encode"].payload_bytes
-        )
+        assert results["msgpack_encode"].payload_bytes < results["json_encode"].payload_bytes
 
 
 class TestOtherBenchmarks:

@@ -45,10 +45,7 @@ def to_log_mel(
     """
     # `.copy()` because frombuffer yields a read-only view, and torch refuses to
     # wrap non-writable memory without warning.
-    if isinstance(audio, np.ndarray):
-        waveform = torch.from_numpy(audio.copy())
-    else:
-        waveform = audio
+    waveform = torch.from_numpy(audio.copy()) if isinstance(audio, np.ndarray) else audio
     waveform = waveform.to(device=device, dtype=torch.float32)
 
     mel = transform(waveform)

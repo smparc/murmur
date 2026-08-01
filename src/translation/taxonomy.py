@@ -110,8 +110,7 @@ class Diagnosis:
 _UNRECOGNISED = FaultSignature(
     name="Unrecognised acoustic anomaly",
     description=(
-        "Sound departs from this node's baseline but does not match a known "
-        "fault signature"
+        "Sound departs from this node's baseline but does not match a known fault signature"
     ),
     frequency_bands_hz=(),
     character="broadband",
@@ -129,8 +128,7 @@ DEFAULT_TAXONOMY: tuple[FaultSignature, ...] = (
     FaultSignature(
         name="Bearing race defect",
         description=(
-            "High-frequency tonal squeal with harmonics, typical of spalling on "
-            "a bearing race"
+            "High-frequency tonal squeal with harmonics, typical of spalling on a bearing race"
         ),
         frequency_bands_hz=((2000.0, 4500.0), (5000.0, 7000.0)),
         character="tonal",
@@ -139,9 +137,7 @@ DEFAULT_TAXONOMY: tuple[FaultSignature, ...] = (
             "Contamination ingress",
             "Fatigue spalling on the outer race",
         ),
-        recommended_action=(
-            "Schedule bearing inspection; check lubricant level and condition."
-        ),
+        recommended_action=("Schedule bearing inspection; check lubricant level and condition."),
         urgency="schedule",
     ),
     FaultSignature(
@@ -258,9 +254,7 @@ class FaultTaxonomy:
             score += math.sqrt((weight / total_weight) * band.share)
         return min(1.0, score)
 
-    def diagnose(
-        self, explanation: AnomalyExplanation, limit: int = 3
-    ) -> list[Diagnosis]:
+    def diagnose(self, explanation: AnomalyExplanation, limit: int = 3) -> list[Diagnosis]:
         """
         Rank candidate faults for an explained anomaly.
 
@@ -282,19 +276,13 @@ class FaultTaxonomy:
                 # Only cite bands that carry real weight, or the evidence list
                 # fills with negligible bands and stops being readable.
                 if overlap > 0.4 and band.share > 0.1:
-                    matched.append(
-                        f"{band.share:.0%} of error in {band.describe().split(' (')[0]}"
-                    )
+                    matched.append(f"{band.share:.0%} of error in {band.describe().split(' (')[0]}")
 
-            scored.append(
-                Diagnosis(signature=signature, confidence=score, evidence=tuple(matched))
-            )
+            scored.append(Diagnosis(signature=signature, confidence=score, evidence=tuple(matched)))
 
         if not scored:
             dominant = explanation.dominant_band
-            evidence = (
-                (f"dominant energy {dominant.describe()}",) if dominant else ()
-            )
+            evidence = (f"dominant energy {dominant.describe()}",) if dominant else ()
             return [Diagnosis(_UNRECOGNISED, confidence=0.0, evidence=evidence)]
 
         scored.sort(key=lambda d: d.confidence, reverse=True)

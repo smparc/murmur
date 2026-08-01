@@ -11,6 +11,8 @@ fault actually occupies. That is the only way to show the chain works rather
 than merely runs.
 """
 
+from itertools import pairwise
+
 import numpy as np
 import pytest
 import torch
@@ -72,7 +74,7 @@ class TestMelBinFrequencies:
 
     def test_centres_increase_monotonically(self):
         centres = mel_bin_frequencies(64, 16_000)
-        assert all(b > a for a, b in zip(centres, centres[1:]))
+        assert all(b > a for a, b in pairwise(centres))
 
     def test_centres_stay_inside_the_nyquist_range(self):
         centres = mel_bin_frequencies(64, 16_000)
@@ -152,7 +154,7 @@ class TestExplainAnomaly:
         explanation = explain_anomaly(
             trained_autoencoder, _spectrogram(FaultType.NONE, 0.0), SAMPLE_RATE
         )
-        for lower, upper in zip(explanation.bands, explanation.bands[1:]):
+        for lower, upper in pairwise(explanation.bands):
             assert upper.low_hz > lower.low_hz
 
     def test_bands_partition_the_spectrum_without_gaps(self, trained_autoencoder):
@@ -161,7 +163,7 @@ class TestExplainAnomaly:
         )
         # Every mel bin must be counted exactly once, so consecutive band edges
         # must not leave a hole.
-        for lower, upper in zip(explanation.bands, explanation.bands[1:]):
+        for lower, upper in pairwise(explanation.bands):
             assert upper.low_hz > lower.high_hz
 
     def test_error_map_is_omitted_by_default(self, trained_autoencoder):
@@ -308,9 +310,7 @@ class TestFaultTaxonomy:
         assert confidences == sorted(confidences, reverse=True)
 
     def test_limit_is_respected(self):
-        explanation = self._explanation(
-            [BandContribution(1000.0, 8000.0, 1.0, 0)]
-        )
+        explanation = self._explanation([BandContribution(1000.0, 8000.0, 1.0, 0)])
         assert len(FaultTaxonomy(min_confidence=0.0).diagnose(explanation, limit=2)) == 2
 
     def test_diagnosis_serialises_with_its_evidence(self):

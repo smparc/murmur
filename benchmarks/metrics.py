@@ -361,9 +361,7 @@ def summarize(
         "roc_auc": roc_auc(scores, labels),
         "pauc_10": partial_roc_auc(scores, labels, max_fpr=0.1),
         "average_precision": average_precision(scores, labels),
-        "false_alarms_per_hour": false_alarm_rate_per_hour(
-            predictions, labels, frame_interval_s
-        ),
+        "false_alarms_per_hour": false_alarm_rate_per_hour(predictions, labels, frame_interval_s),
         "frames": len(scores),
         "positive_rate": (sum(1 for v in labels if v) / len(labels)) if labels else 0.0,
     }
