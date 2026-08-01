@@ -115,6 +115,13 @@ class TelemetryRequest(BaseModel):
     # source — both are degraded-but-valid states, not errors.
     ttf_interval: TTFInterval | None = None
     source_position: list[float] | None = None
+    # Spectral attribution and the catalogue match derived from it. Both are
+    # computed by the worker, which is where the autoencoder that produced the
+    # error map lives. Optional because a frame that did not flag has nothing to
+    # attribute, and because a worker running without trained weights cannot
+    # produce an honest one.
+    explanation: dict | None = None
+    diagnosis: dict | None = None
 
     @field_validator("source_position")
     @classmethod
@@ -163,6 +170,8 @@ class TelemetryResponse(BaseModel):
     generated: bool = Field(description="True when an LLM produced the text; False when templated.")
     ttf_interval: TTFInterval | None = None
     source_position: list[float] | None = None
+    explanation: dict | None = None
+    diagnosis: dict | None = None
 
 
 class HealthResponse(BaseModel):
@@ -462,15 +471,34 @@ _SEVERITY_DESCRIPTION = {
 
 
 def _build_prompt(request: TelemetryRequest) -> str:
-    return (
-        f"System Diagnostic for Node {request.node_id}:\n"
-        f"Status: Sensor is "
-        f"{_SEVERITY_DESCRIPTION.get(request.anomaly_severity, 'in an unknown state')}.\n"
+    """
+    Assemble the generation prompt.
+
+    Measured spectral evidence and the catalogue match are stated explicitly
+    when the worker supplied them. Without that, the only acoustic signal the
+    model receives is the projected embedding — and until the projector is
+    trained, that projection is random, so the narrative is the model's prior
+    dressed as a diagnosis. Naming the band and the candidate fault in the text
+    gives it something true to condition on.
+    """
+    lines = [
+        f"System Diagnostic for Node {request.node_id}:",
+        "Status: Sensor is "
+        f"{_SEVERITY_DESCRIPTION.get(request.anomaly_severity, 'in an unknown state')}.",
         f"Anomaly score: {request.anomaly_score:.3f} "
         f"(robust z={request.z_score:.2f}). "
-        f"Failure probability: {request.ttf_prediction:.1%}.\n"
-        f"Analysis: "
-    )
+        f"Failure probability: {request.ttf_prediction:.1%}.",
+    ]
+
+    if request.explanation and (summary := request.explanation.get("summary")):
+        lines.append(f"Spectral evidence: {summary}.")
+    if request.diagnosis and (fault := request.diagnosis.get("fault")):
+        confidence = request.diagnosis.get("confidence")
+        suffix = f" ({confidence:.0%} confidence)" if isinstance(confidence, int | float) else ""
+        lines.append(f"Closest catalogued fault: {fault}{suffix}.")
+
+    lines.append("Analysis: ")
+    return "\n".join(lines)
 
 
 def _template_telemetry(request: TelemetryRequest) -> str:
@@ -480,6 +508,13 @@ def _template_telemetry(request: TelemetryRequest) -> str:
         "warning": "Deviation from baseline acoustic signature detected.",
         "critical": "Severe acoustic anomaly — inspection recommended.",
     }[request.anomaly_severity]
+    # The templated path is what most deployments actually run — the LLM is
+    # optional and the structured payload is the safety-critical part — so the
+    # grounded diagnosis has to appear here too, not only in generated prose.
+    if request.diagnosis and (fault := request.diagnosis.get("fault")):
+        action = request.diagnosis.get("recommended_action", "")
+        headline = f"{headline} Closest catalogued fault: {fault}. {action}".strip()
+
     return (
         f"Node {request.node_id}: {headline} "
         f"Anomaly score {request.anomaly_score:.3f} (z={request.z_score:.2f}); "
@@ -580,6 +615,8 @@ async def generate_telemetry(request: TelemetryRequest) -> TelemetryResponse:
         generated=generated,
         ttf_interval=request.ttf_interval,
         source_position=request.source_position,
+        explanation=request.explanation,
+        diagnosis=request.diagnosis,
     )
 
     payload = response.model_dump()

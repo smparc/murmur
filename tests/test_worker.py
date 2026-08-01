@@ -342,6 +342,66 @@ class TestInferenceWorker:
         assert reporting == set(range(settings.NUM_NODES - 1))
         assert settings.NUM_NODES - 1 not in reporting
 
+    def test_flagged_frames_carry_spectral_evidence(self, worker):
+        """
+        "Node 3, anomaly score 0.87" is not actionable. A technician needs to
+        know what the system heard, and which catalogued fault that resembles.
+        """
+        # The autoencoder is resident (if untrained) — enough for the error map
+        # to decompose, which is all the attribution needs.
+        worker.weights_loaded = True
+        worker.scorer.warmup_frames = 3
+
+        payloads: list[dict] = []
+        for step in range(8):
+            now = time.time() + step
+            for node in range(settings.NUM_NODES):
+                worker.handle_window(_window(node, now, amplitude=0.05))
+
+        final = time.time() + 100
+        for node in range(settings.NUM_NODES):
+            amplitude = 60.0 if node == 1 else 0.05
+            payloads = worker.handle_window(_window(node, final, amplitude=amplitude)) or payloads
+
+        flagged = [p for p in payloads if p["is_anomaly"]]
+        assert flagged, "expected the loud node to flag"
+        for payload in flagged:
+            assert payload["explanation"]["bands"]
+            assert payload["explanation"]["summary"]
+            assert payload["diagnosis"]["fault"]
+            assert payload["diagnosis"]["urgency"] in {"monitor", "schedule", "urgent"}
+
+    def test_quiet_frames_pay_nothing_for_attribution(self, worker):
+        """Attribution is off the steady-state path; most frames are normal."""
+        worker.weights_loaded = True
+        now = time.time()
+        payloads: list[dict] = []
+        for node in range(settings.NUM_NODES):
+            payloads = worker.handle_window(_window(node, now, amplitude=0.05)) or payloads
+
+        assert payloads
+        assert all(not p["is_anomaly"] for p in payloads)
+        assert all("explanation" not in p for p in payloads)
+
+    def test_untrained_worker_does_not_invent_an_explanation(self, worker):
+        """
+        Without a trained autoencoder the scorer falls back to frame energy, so
+        there is no reconstruction-error map to decompose and any attribution
+        would be fabricated.
+        """
+        assert worker.weights_loaded is False
+        worker.scorer.warmup_frames = 1
+
+        payloads: list[dict] = []
+        for step in range(4):
+            now = time.time() + step
+            for node in range(settings.NUM_NODES):
+                amplitude = 60.0 if (node == 1 and step == 3) else 0.05
+                result = worker.handle_window(_window(node, now, amplitude=amplitude))
+                payloads = result or payloads
+
+        assert all("explanation" not in p for p in payloads)
+
     def test_submit_survives_unreachable_api(self):
         w = InferenceWorker(inference_url="http://127.0.0.1:1", load_weights=False)
         try:
