@@ -204,6 +204,17 @@ All settings are environment variables, validated at import. See
 | `LLM_ENABLED` | `true` | Set `false` to serve templated telemetry |
 | `MURMUR_API_KEY` | *(empty)* | Enables `X-API-Key` auth when set |
 | `RATE_LIMIT_PER_MINUTE` | `1200` | Must exceed `NUM_NODES` per `CHUNK_DURATION` |
+| `RATE_LIMIT_MAX_KEYS` | `10000` | Cap on retained rate-limit buckets, so the limiter cannot itself exhaust memory |
+| `METRICS_REQUIRE_AUTH` | `true` | Gate `/metrics` behind the API key; set `false` for an in-cluster scraper |
+| `ARRAY_MAX_WAIT` | `15.0` | Seconds to wait for absent microphones before emitting a degraded snapshot |
+| `ARRAY_MIN_NODES` | `2` | Minimum microphones reporting before a snapshot is released at all |
+| `WINDOW_STALENESS_TOLERANCE` | `5.0` | Spread (s) across one snapshot still treated as a single acoustic instant |
+| `PUBLISH_FRAME_TOPIC` | `false` | Publish the per-frame topic; nothing in Murmur consumes it |
+| `SLACK_WEBHOOK_URL` | *(empty)* | Slack incoming webhook for alerts |
+| `PAGERDUTY_ROUTING_KEY` | *(empty)* | PagerDuty Events v2 routing key |
+| `ALERT_WEBHOOK_URL` | *(empty)* | Generic JSON webhook for alerts |
+| `ALERT_COOLDOWN_SECONDS` | `900` | Silence per node and fault after a page; escalation bypasses it |
+| `ALERT_MIN_SEVERITY` | `warning` | Lowest severity that pages |
 | `TDOA_ENABLED` | `true` | Enable GCC-PHAT source localization |
 | `TDOA_MIN_COHERENCE` | `0.15` | Minimum correlation for a pair to inform the position solve |
 | `TDOA_STALENESS_TOLERANCE` | `0.5` | Max array clock spread (s) treated as one acoustic instant |
