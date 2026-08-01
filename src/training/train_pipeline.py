@@ -145,7 +145,21 @@ def generate_degradation_data(
         signal = rng.normal(0.0, floor, size=(seq_length, num_nodes, in_channels))
 
         if rng.random() < anomaly_ratio:
-            severity = float(rng.uniform(0.5, 1.0))
+            # Degradation is continuous, and sampling it that way is not a
+            # detail. Drawing severity from [0.5, 1.0] while healthy sequences
+            # sat below 0.1 left a 0.4-wide hole in the label distribution with
+            # the 0.5 decision threshold in the middle of it, so the two classes
+            # were separable by construction and F1 was 1.000 for any model that
+            # noticed a fault was present at all. It also confined the
+            # ``warning`` stratum to the sliver [0.5, 0.66), starving the
+            # per-group conformal calibration that exists precisely to hold
+            # coverage in the high-risk bands.
+            #
+            # Spanning the full range instead puts examples on both sides of the
+            # threshold and overlaps the healthy band at the bottom, so a faintly
+            # degrading machine is genuinely hard to distinguish from a healthy
+            # one — which is the regime predictive maintenance operates in.
+            severity = float(rng.uniform(0.05, 1.0))
             source = int(rng.integers(num_nodes))
             fault = fault_names[int(rng.integers(len(fault_names)))]
             profile = _spectral_profile(in_channels, fault)
