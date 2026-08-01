@@ -171,13 +171,9 @@ class TestAuth:
         Service that was public whenever an API key was configured.
         """
         assert secured_client.get("/metrics").status_code == 401
-        assert (
-            secured_client.get("/metrics", headers={"X-API-Key": "test-key"}).status_code == 200
-        )
+        assert secured_client.get("/metrics", headers={"X-API-Key": "test-key"}).status_code == 200
 
-    def test_metrics_can_be_opened_for_in_cluster_scrapers(
-        self, secured_client, override_settings
-    ):
+    def test_metrics_can_be_opened_for_in_cluster_scrapers(self, secured_client, override_settings):
         """A Prometheus that cannot present a key needs an escape hatch."""
         override_settings(METRICS_REQUIRE_AUTH=False)
         assert secured_client.get("/metrics").status_code == 200

@@ -229,9 +229,7 @@ class WindowAssembler:
         # silently shorten every forecast horizon.
         reporting = [w for w in present if w is not None]
         timespans = (
-            torch.from_numpy(np.mean([w.timespans for w in reporting], axis=0))
-            .float()
-            .unsqueeze(0)
+            torch.from_numpy(np.mean([w.timespans for w in reporting], axis=0)).float().unsqueeze(0)
         )
 
         snapshot = dict(self._windows)
