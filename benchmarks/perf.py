@@ -222,20 +222,24 @@ def benchmark_detection(iterations: int = 100) -> dict[str, TimingResult]:
 
 
 def benchmark_localization(iterations: int = 50) -> dict[str, TimingResult]:
-    """GCC-PHAT plus multilateration for a four-microphone array."""
-    from src.localization import locate_source
+    """GCC-PHAT plus source solve for the configured microphone array."""
+    from src.mapping.tdoa import localize_source, pairwise_tdoa
 
     rng = np.random.default_rng(0)
-    mics = settings.DEFAULT_MIC_COORDS
-    signals = {
-        i: rng.normal(0, 0.2, settings.SAMPLES_PER_CHUNK).astype(np.float64)
-        for i in range(len(mics))
-    }
+    mics = settings.MIC_COORDS
+    # (num_mics, num_samples), which is the layout pairwise_tdoa expects.
+    channels = rng.normal(0, 0.2, (len(mics), settings.SAMPLES_PER_CHUNK)).astype(np.float64)
+
+    def solve() -> None:
+        estimates = pairwise_tdoa(
+            channels, mics, settings.SAMPLE_RATE, interp=settings.TDOA_INTERP
+        )
+        localize_source(estimates, mics)
 
     return {
         "localization": time_it(
-            f"localization ({len(mics)} mics)",
-            lambda: locate_source(signals, mics, settings.SAMPLE_RATE),
+            f"GCC-PHAT + solve ({len(mics)} mics)",
+            solve,
             iterations,
         )
     }
