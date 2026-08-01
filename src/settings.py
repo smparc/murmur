@@ -255,6 +255,26 @@ class Settings:
     # propagation and the GCN collapses to a per-node MLP.
     TDOA_EDGE_FLOOR: float = field(default_factory=lambda: _env_float("TDOA_EDGE_FLOOR", 0.05))
 
+    # -- Alerting --
+    # A prediction nobody sees changes nothing. All three are empty by default:
+    # a monitoring system must not page anyone until someone has deliberately
+    # configured it to, so an unset deployment routes nowhere rather than
+    # somewhere surprising.
+    SLACK_WEBHOOK_URL: str = field(default_factory=lambda: _env_str("SLACK_WEBHOOK_URL", ""))
+    PAGERDUTY_ROUTING_KEY: str = field(
+        default_factory=lambda: _env_str("PAGERDUTY_ROUTING_KEY", "")
+    )
+    ALERT_WEBHOOK_URL: str = field(default_factory=lambda: _env_str("ALERT_WEBHOOK_URL", ""))
+    # Silence per node and fault after a page. Escalation bypasses it — a fault
+    # getting worse is new information — but a steady fault must not re-page
+    # every half-second chunk, which is how alerting integrations get muted.
+    ALERT_COOLDOWN_SECONDS: float = field(
+        default_factory=lambda: _env_float("ALERT_COOLDOWN_SECONDS", 900.0)
+    )
+    ALERT_MIN_SEVERITY: str = field(
+        default_factory=lambda: _env_str("ALERT_MIN_SEVERITY", "warning")
+    )
+
     # -- Forecast uncertainty --
     # Target miscoverage for conformal prediction intervals: 0.1 gives 90%
     # coverage. See src/forecasting/conformal.py.
@@ -364,6 +384,16 @@ class Settings:
             errors.append(
                 f"TDOA_STALENESS_TOLERANCE must be > 0, got {self.TDOA_STALENESS_TOLERANCE}"
             )
+        if self.ALERT_COOLDOWN_SECONDS < 0:
+            errors.append(
+                f"ALERT_COOLDOWN_SECONDS must be >= 0, got {self.ALERT_COOLDOWN_SECONDS}"
+            )
+        if self.ALERT_MIN_SEVERITY not in {"normal", "warning", "critical"}:
+            errors.append(
+                f"ALERT_MIN_SEVERITY must be normal, warning or critical, "
+                f"got {self.ALERT_MIN_SEVERITY!r}"
+            )
+
         if not 0 < self.CONFORMAL_ALPHA < 1:
             errors.append(f"CONFORMAL_ALPHA must be in (0, 1), got {self.CONFORMAL_ALPHA}")
 

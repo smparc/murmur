@@ -354,6 +354,7 @@ class InferenceWorker:
         # the model chain but not free, so they run only for frames that actually
         # flagged — see infer().
         self.taxonomy = FaultTaxonomy()
+        self.alerts = _build_alert_router()
 
         self._client = http_client or httpx.Client(timeout=30.0)
         self._owns_client = http_client is None

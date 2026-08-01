@@ -99,6 +99,63 @@ class TestGeneration:
         )
 
 
+class TestGroundedDiagnosis:
+    """
+    The projector that conditions generated text on audio is a random projection
+    until it is trained, so prose derived from it is the model's prior wearing a
+    diagnosis. Measured spectral evidence and a catalogue match give the output
+    something true to rest on — and must survive to the client either way.
+    """
+
+    _EVIDENCE = {
+        "explanation": {
+            "total_error": 0.42,
+            "summary": "energy concentrated at 2.1-3.4 kHz (46%)",
+            "bands": [{"low_hz": 2100.0, "high_hz": 3400.0, "share": 0.46, "peak_frame": 3}],
+        },
+        "diagnosis": {
+            "fault": "Bearing race defect",
+            "confidence": 0.72,
+            "urgency": "schedule",
+            "recommended_action": "Schedule bearing inspection.",
+        },
+    }
+
+    def test_evidence_is_echoed_to_the_client(self, api_client):
+        body = api_client.post(
+            "/generate_telemetry", json=_valid_payload(**self._EVIDENCE)
+        ).json()
+
+        assert body["diagnosis"]["fault"] == "Bearing race defect"
+        assert body["explanation"]["bands"][0]["low_hz"] == 2100.0
+
+    def test_templated_text_names_the_fault(self, api_client):
+        """The LLM is optional; the templated path is what most sites run."""
+        body = api_client.post(
+            "/generate_telemetry", json=_valid_payload(**self._EVIDENCE)
+        ).json()
+
+        assert "Bearing race defect" in body["telemetry"]
+        assert body["generated"] is False
+
+    def test_evidence_is_optional(self, api_client):
+        """A frame that never flagged has nothing to attribute."""
+        body = api_client.post("/generate_telemetry", json=_valid_payload()).json()
+
+        assert body["diagnosis"] is None
+        assert body["explanation"] is None
+        assert body["telemetry"]
+
+    def test_prompt_states_the_evidence(self):
+        from src.translation.llm_decoder import TelemetryRequest, _build_prompt
+
+        prompt = _build_prompt(TelemetryRequest(**_valid_payload(**self._EVIDENCE)))
+
+        assert "2.1-3.4 kHz" in prompt
+        assert "Bearing race defect" in prompt
+        assert "72% confidence" in prompt
+
+
 class TestMetrics:
     def test_metrics_exposes_recorded_series(self, api_client):
         api_client.post("/generate_telemetry", json=_valid_payload())
