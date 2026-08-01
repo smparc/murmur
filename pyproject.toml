@@ -77,7 +77,12 @@ Homepage = "https://github.com/smparc/murmur"
 Repository = "https://github.com/smparc/murmur"
 
 [tool.setuptools.packages.find]
-include = ["src*", "orchestration*"]
+# benchmarks* is here because the test suite imports it. Without it `pip
+# install -e .` does not expose the package, and CI — which invokes `pytest`
+# directly rather than `python -m pytest` — has no CWD on sys.path to fall back
+# on, so every test file touching it fails at collection. That aborts the whole
+# run, including jobs whose own tests would have been skipped.
+include = ["src*", "orchestration*", "benchmarks*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
