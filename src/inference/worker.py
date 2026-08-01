@@ -40,6 +40,14 @@ import msgpack
 import numpy as np
 import torch
 
+from src.alerting.webhook import (
+    Alert,
+    AlertRouter,
+    AlertSink,
+    GenericWebhookSink,
+    PagerDutySink,
+    SlackSink,
+)
 from src.detection.anomaly_detector import AnomalyScorer, ScoreResult, SpectrogramAutoencoder
 from src.explain.saliency import explain_anomaly
 from src.forecasting.conformal import ConformalCalibrator, severity_bucket
@@ -66,6 +74,32 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CONSUME_BATCH_SIZE = 16
 CONSUME_TIMEOUT_SECONDS = 0.5
+
+
+def _build_alert_router() -> AlertRouter:
+    """
+    Assemble the alert router from configuration.
+
+    Every sink is opt-in and all are unset by default, so an unconfigured
+    deployment gets a router with no sinks — which is a no-op, not an error. A
+    monitoring system paging somebody because a URL happened to be lying around
+    in the environment is worse than one that stays quiet until asked.
+    """
+    sinks: list[AlertSink] = []
+    if settings.SLACK_WEBHOOK_URL:
+        sinks.append(SlackSink(settings.SLACK_WEBHOOK_URL))
+    if settings.PAGERDUTY_ROUTING_KEY:
+        sinks.append(PagerDutySink(settings.PAGERDUTY_ROUTING_KEY))
+    if settings.ALERT_WEBHOOK_URL:
+        sinks.append(GenericWebhookSink(settings.ALERT_WEBHOOK_URL))
+
+    if sinks:
+        log.info("Alert routing enabled: %s", ", ".join(s.name for s in sinks))
+    return AlertRouter(
+        sinks=sinks,
+        cooldown_s=settings.ALERT_COOLDOWN_SECONDS,
+        min_severity=settings.ALERT_MIN_SEVERITY,
+    )
 
 
 @dataclass
@@ -626,7 +660,39 @@ class InferenceWorker:
         for payload in payloads:
             if not self.submit(payload):
                 TELEMETRY_DROPPED.labels(node_id=str(payload["node_id"])).inc()
+            self._raise_alert(payload)
         return payloads
+
+    def _raise_alert(self, payload: dict) -> None:
+        """
+        Route a scored frame to the configured alert sinks.
+
+        Failure here must never propagate: a wedged webhook is not a reason to
+        stop scoring the plant, and the telemetry has already been submitted by
+        the time this runs.
+        """
+        if not self.alerts.sinks:
+            return
+
+        diagnosis = payload.get("diagnosis") or {}
+        alert = Alert(
+            node_id=payload["node_id"],
+            severity=payload["anomaly_severity"],
+            fault=diagnosis.get("fault", "Unrecognised acoustic anomaly"),
+            confidence=float(diagnosis.get("confidence", 0.0)),
+            anomaly_score=payload["anomaly_score"],
+            ttf_prediction=payload["ttf_prediction"],
+            evidence=tuple(diagnosis.get("evidence", ())),
+            recommended_action=diagnosis.get("recommended_action", ""),
+            location=tuple(payload["source_position"]) if payload.get("source_position") else None,
+            timestamp=payload["timestamp"],
+            resolved=not payload["is_anomaly"],
+        )
+        try:
+            self.alerts.send(alert)
+        except Exception:
+            PIPELINE_ERRORS.labels(stage="alerting").inc()
+            log.warning("Alert delivery failed for node %s", payload["node_id"], exc_info=True)
 
     def close(self) -> None:
         if self._owns_client:
