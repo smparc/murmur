@@ -173,7 +173,14 @@ class Settings:
     TRAIN_EPOCHS: int = field(default_factory=lambda: _env_int("TRAIN_EPOCHS", 50))
     TRAIN_BATCH_SIZE: int = field(default_factory=lambda: _env_int("TRAIN_BATCH_SIZE", 16))
     LEARNING_RATE: float = field(default_factory=lambda: _env_float("LEARNING_RATE", 1e-3))
-    TRAIN_NUM_SAMPLES: int = field(default_factory=lambda: _env_int("TRAIN_NUM_SAMPLES", 1000))
+    # Sized so per-stratum conformal calibration is actually estimable. Only
+    # half the test split calibrates — 7.5% of this number — and it is then
+    # partitioned by severity, so at 1000 the `warning` band received about
+    # seven samples against a `min_group_size` of 30 and silently fell back to
+    # the global radius. That defeats the point of grouping: coverage is then
+    # guaranteed on a population dominated by healthy machines rather than
+    # within the high-risk bands anyone would act on.
+    TRAIN_NUM_SAMPLES: int = field(default_factory=lambda: _env_int("TRAIN_NUM_SAMPLES", 4000))
     EARLY_STOP_PATIENCE: int = field(default_factory=lambda: _env_int("EARLY_STOP_PATIENCE", 10))
     SEED: int = field(default_factory=lambda: _env_int("SEED", 1337))
 

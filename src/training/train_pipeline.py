@@ -776,7 +776,12 @@ def train() -> dict[str, float]:
         seq_length=settings.SEQ_LENGTH,
         num_nodes=num_nodes,
         in_channels=settings.GNN_IN_CHANNELS,
-        anomaly_ratio=0.30,
+        # A deliberately sicker fleet than a real plant. This is a property of
+        # the simulator, not a claim about industry: the calibration set is a
+        # fraction of a fraction of these sequences and is then split by
+        # severity, so a realistic 5% fault rate leaves the high-severity strata
+        # too sparse to estimate a quantile from.
+        anomaly_ratio=0.40,
         mic_coords=mics,
         seed=settings.SEED,
     )
