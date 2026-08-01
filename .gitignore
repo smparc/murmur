@@ -72,3 +72,13 @@ coverage.xml
 
 # Jupyter
 .ipynb_checkpoints/
+
+
+# LaTeX build artifacts (the .tex and .pdf are tracked; these are regenerated)
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
