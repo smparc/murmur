@@ -24,6 +24,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
+# The ranking statistics themselves live in src.evaluation.metrics — one
+# implementation, so there is one place for a rank or tie-handling bug to be.
+# What is genuinely different here is the policy at the edges: a benchmark sweep
+# runs across many machine types and must not abort on the one that happens to
+# be all-normal, so a degenerate split reports chance instead of raising.
+from src.evaluation.metrics import partial_auc as _core_partial_auc
+from src.evaluation.metrics import roc_auc as _core_roc_auc
+
 __all__ = [
     "DetectionMetrics",
     "LeadTimeMetrics",
@@ -44,26 +52,9 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def _average_ranks(values: Sequence[float]) -> list[float]:
-    """
-    1-based ranks with ties averaged.
-
-    Tie handling is not a detail here. Reconstruction error saturates, and a
-    detector that assigns the *same* score to many frames would otherwise be
-    credited or penalised depending purely on input ordering.
-    """
-    order = sorted(range(len(values)), key=lambda i: values[i])
-    ranks = [0.0] * len(values)
-    i = 0
-    while i < len(order):
-        j = i
-        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
-            j += 1
-        shared = 0.5 * ((i + 1) + (j + 1))  # mean of 1-based positions i..j
-        for k in range(i, j + 1):
-            ranks[order[k]] = shared
-        i = j + 1
-    return ranks
+def _has_both_classes(labels: Sequence[int]) -> bool:
+    n_pos = sum(1 for v in labels if v)
+    return 0 < n_pos < len(labels)
 
 
 def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> float:
@@ -76,45 +67,12 @@ def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> float:
     """
     if len(scores) != len(labels):
         raise ValueError("scores and labels must be the same length")
-    n_pos = sum(1 for v in labels if v)
-    n_neg = len(labels) - n_pos
-    if n_pos == 0 or n_neg == 0:
+    if not _has_both_classes(labels):
         return 0.5
-
-    ranks = _average_ranks(scores)
-    rank_sum = sum(r for r, v in zip(ranks, labels) if v)
-    return (rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return _core_roc_auc(scores, labels)
 
 
-def _roc_curve(scores: Sequence[float], labels: Sequence[int]) -> tuple[list[float], list[float]]:
-    """ROC points as ``(fpr, tpr)``, swept high-score-first. Starts at (0, 0)."""
-    n_pos = sum(1 for v in labels if v)
-    n_neg = len(labels) - n_pos
-    if n_pos == 0 or n_neg == 0:
-        return [0.0, 1.0], [0.0, 1.0]
-
-    paired = sorted(zip(scores, labels), key=lambda p: -p[0])
-    fprs, tprs = [0.0], [0.0]
-    tp = fp = 0
-    i = 0
-    while i < len(paired):
-        threshold = paired[i][0]
-        # Consume the whole tie group before emitting a point, otherwise the
-        # curve records operating points that no threshold can actually select.
-        while i < len(paired) and paired[i][0] == threshold:
-            if paired[i][1]:
-                tp += 1
-            else:
-                fp += 1
-            i += 1
-        fprs.append(fp / n_neg)
-        tprs.append(tp / n_pos)
-    return fprs, tprs
-
-
-def partial_roc_auc(
-    scores: Sequence[float], labels: Sequence[int], max_fpr: float = 0.1
-) -> float:
+def partial_roc_auc(scores: Sequence[float], labels: Sequence[int], max_fpr: float = 0.1) -> float:
     """
     ROC AUC restricted to ``fpr <= max_fpr``, normalised back to ``[0, 1]``.
 
@@ -122,25 +80,17 @@ def partial_roc_auc(
     honest one for maintenance: the only region of the ROC curve a plant will
     ever operate in is the low-false-positive end. A model can buy a strong full
     AUC with behaviour at 60% FPR that nobody would ever deploy.
+
+    A degenerate split reports chance for the strip (``max_fpr / 2``), matching
+    :func:`roc_auc`'s reason for not raising.
     """
     if not 0.0 < max_fpr <= 1.0:
         raise ValueError("max_fpr must be in (0, 1]")
-
-    fprs, tprs = _roc_curve(scores, labels)
-
-    area = 0.0
-    for (f0, t0), (f1, t1) in zip(zip(fprs, tprs), zip(fprs[1:], tprs[1:])):
-        if f0 >= max_fpr:
-            break
-        if f1 > max_fpr:
-            # Clip the final trapezoid at the cutoff, interpolating the TPR.
-            span = f1 - f0
-            t_at_cut = t0 if span <= 0 else t0 + (t1 - t0) * (max_fpr - f0) / span
-            area += 0.5 * (t0 + t_at_cut) * (max_fpr - f0)
-            break
-        area += 0.5 * (t0 + t1) * (f1 - f0)
-
-    return area / max_fpr
+    if len(scores) != len(labels):
+        raise ValueError("scores and labels must be the same length")
+    if not _has_both_classes(labels):
+        return max_fpr / 2.0
+    return _core_partial_auc(scores, labels, max_fpr)
 
 
 def average_precision(scores: Sequence[float], labels: Sequence[int]) -> float:
