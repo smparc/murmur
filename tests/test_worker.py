@@ -413,25 +413,99 @@ class TestInferenceWorker:
         for node in range(settings.NUM_NODES):
             worker.handle_window(_window(node, now))  # must not raise
 
-    def test_alerts_reach_configured_sinks(self, worker):
-        """A prediction nobody sees changes nothing."""
+    def _capture_alerts(self, worker) -> list[dict]:
+        """Point the worker's router at an in-memory sink."""
         from src.alerting.webhook import GenericWebhookSink
 
         delivered: list[dict] = []
+        worker.alerts.sinks = [
+            GenericWebhookSink(
+                "https://example.invalid",
+                transport=lambda url, payload, headers: delivered.append(payload) or True,
+            )
+        ]
+        return delivered
 
-        def transport(url, payload, headers):
-            delivered.append(payload)
-            return True
+    @staticmethod
+    def _scored(severity: str, *, node_id: int = 1, fault: str | None = "Bearing race defect"):
+        payload = {
+            "node_id": node_id,
+            "timestamp": 1000.0,
+            "anomaly_score": 0.9,
+            "anomaly_severity": severity,
+            "ttf_prediction": 0.4,
+            "is_anomaly": severity != "normal",
+            "z_score": 6.0,
+        }
+        if fault is not None:
+            payload["diagnosis"] = {
+                "fault": fault,
+                "confidence": 0.7,
+                "recommended_action": "Inspect the bearing.",
+                "evidence": ["2.1-3.4 kHz (46%)"],
+            }
+        return payload
 
-        worker.alerts.sinks = [GenericWebhookSink("https://example.invalid", transport=transport)]
-        worker.alerts.min_severity = "normal"
+    def test_alerts_reach_configured_sinks(self, worker):
+        """A prediction nobody sees changes nothing."""
+        delivered = self._capture_alerts(worker)
 
-        now = time.time()
-        for node in range(settings.NUM_NODES):
-            worker.handle_window(_window(node, now))
+        worker._raise_alert(self._scored("critical"))
 
-        assert delivered, "a configured sink must receive the scored frame"
-        assert {"node_id", "severity", "fault"} <= delivered[0].keys()
+        assert delivered, "a flagged frame must reach the configured sink"
+        assert delivered[0]["node_id"] == 1
+        assert delivered[0]["fault"] == "Bearing race defect"
+
+    def test_a_healthy_frame_pages_nobody(self, worker):
+        delivered = self._capture_alerts(worker)
+
+        worker._raise_alert(self._scored("normal"))
+
+        assert delivered == []
+
+    def test_a_steady_fault_does_not_re_page_every_frame(self, worker):
+        """
+        Cooldown is what keeps an alerting integration from being muted. The
+        pipeline scores every node twice a second; a sustained fault that paged
+        on each one would be silenced by a human within a shift.
+        """
+        delivered = self._capture_alerts(worker)
+
+        for _ in range(20):
+            worker._raise_alert(self._scored("critical"))
+
+        assert len(delivered) == 1, f"cooldown did not suppress; sent {len(delivered)}"
+        assert worker.alerts.suppressed_count == 19
+
+    def test_escalation_breaks_through_the_cooldown(self, worker):
+        """A fault getting worse is new information, not a repeat."""
+        delivered = self._capture_alerts(worker)
+
+        worker._raise_alert(self._scored("warning"))
+        worker._raise_alert(self._scored("critical"))
+
+        assert [d["severity"] for d in delivered] == ["warning", "critical"]
+
+    def test_recovery_clears_the_alert(self, worker):
+        delivered = self._capture_alerts(worker)
+
+        worker._raise_alert(self._scored("critical"))
+        worker._raise_alert(self._scored("normal"))
+
+        assert [d["resolved"] for d in delivered] == [False, True]
+
+    def test_an_undiagnosed_anomaly_still_pages(self, worker):
+        """
+        An unrecognised signature on a machine that was quiet yesterday still
+        deserves a look; dropping it because the catalogue had no match would
+        lose exactly the novel faults worth knowing about.
+        """
+        delivered = self._capture_alerts(worker)
+
+        worker._raise_alert(self._scored("critical", fault=None))
+
+        assert delivered
+        assert delivered[0]["fault"] == "Unrecognised acoustic anomaly"
 
     def test_a_wedged_webhook_does_not_stop_scoring(self, worker):
         """Alerting is downstream of safety; it must never break the pipeline."""
