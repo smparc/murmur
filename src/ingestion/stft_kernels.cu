@@ -15,7 +15,7 @@ extern "C" {
     __global__ void pre_emphasis_kernel(const float* input, float* output, int length, float coeff) {
         // Calculate the global thread ID
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        
+
         if (idx < length) {
             if (idx == 0) {
                 // The first sample has no previous sample to subtract
@@ -32,7 +32,7 @@ extern "C" {
      */
     __global__ void apply_hann_window_kernel(float* frame, int frame_length) {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        
+
         if (idx < frame_length) {
             // Hann window formula: 0.5 * (1 - cos(2*pi*n / (N-1)))
             float multiplier = 0.5f * (1.0f - cosf((2.0f * M_PI * idx) / (frame_length - 1.0f)));

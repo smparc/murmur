@@ -39,11 +39,18 @@ spec:
       labels:
         app: murmur-kafka
     spec:
+      # Matches the uid the Apache image runs as, so the mounted volume is
+      # writable. Bitnami used 1001; carrying that over would leave the broker
+      # unable to write its log directory.
       securityContext:
-        fsGroup: 1001
+        fsGroup: 1000
       containers:
         - name: kafka
-          image: docker.io/bitnami/kafka:3.7
+          # The Apache project's own image. Bitnami withdrew its versioned tags
+          # from Docker Hub, so `bitnami/kafka:3.7` no longer resolves and this
+          # StatefulSet could not pull at all. Note the env prefix differs
+          # between the two images (KAFKA_ vs KAFKA_CFG_).
+          image: apache/kafka:3.7.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: tcp-kafka

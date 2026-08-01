@@ -79,32 +79,33 @@ jobs:
     runs-on: ubuntu-latest
     services:
       kafka:
-        # Same image and KRaft settings as docker-compose.kafka.yml, so a green
-        # CI run means the configuration developers use locally is the one that
-        # was actually exercised. The service previously ran unconfigured.
-        image: docker.io/bitnami/kafka:3.7
+        # The Apache project's own image. Bitnami withdrew its versioned tags
+        # from Docker Hub, so `bitnami/kafka:3.7` no longer resolves anywhere —
+        # note the env prefix differs between the two (KAFKA_ vs KAFKA_CFG_),
+        # so the settings below are not interchangeable with Bitnami's.
+        image: apache/kafka:3.7.0
         ports:
           - 9092:9092
         env:
-          KAFKA_CFG_NODE_ID: "1"
-          KAFKA_CFG_PROCESS_ROLES: controller,broker
-          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-          # One listener is enough here: nothing else runs in the service
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: controller,broker
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          # One client listener is enough: nothing else runs in the service
           # network. It must advertise localhost, because the client is the
           # runner host reaching in through the mapped port — advertising the
           # container hostname would redirect it somewhere it cannot resolve.
-          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-          KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-          KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-          KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-          KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-          KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
-          KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: "1"
-          ALLOW_PLAINTEXT_LISTENER: "yes"
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
         options: >-
-          --health-cmd "kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
           --health-interval 10s
           --health-timeout 10s
           --health-retries 12
