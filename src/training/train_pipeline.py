@@ -30,8 +30,10 @@ from __future__ import annotations
 import logging
 import os
 import random
+import socket
 from contextlib import nullcontext
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import numpy as np
 import torch
@@ -285,12 +287,48 @@ class _Tracker:
 
     enabled: bool = False
 
+    @staticmethod
+    def _server_reachable(uri: str, timeout: float = 2.0) -> bool:
+        """
+        Probe an http(s) tracking server before handing the URI to MLflow.
+
+        MLflow retries a refused connection seven times with exponential
+        backoff. Against a server that simply is not running, that is roughly
+        four and a half minutes of stalling before the exception surfaces and
+        training begins — with the run unrecorded either way. A two-second
+        connect attempt reaches the same conclusion.
+
+        Non-http URIs (a local ``file:`` store, databricks, a database) are left
+        alone: there is no socket to probe and MLflow handles them itself.
+        """
+        parsed = urlparse(uri)
+        if parsed.scheme not in {"http", "https"}:
+            return True
+
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            with socket.create_connection((parsed.hostname, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
     def __post_init__(self) -> None:
         self._mlflow = None
+        uri = settings.MLFLOW_TRACKING_URI
+
+        if not self._server_reachable(uri):
+            log.warning(
+                "No MLflow server at %s — metrics will only be logged locally. "
+                "Start one, or point MLFLOW_TRACKING_URI at a local store "
+                "(file:./mlruns) to record this run.",
+                uri,
+            )
+            return
+
         try:
             import mlflow
 
-            mlflow.set_tracking_uri(settings.MLFLOW_TRACKING_URI)
+            mlflow.set_tracking_uri(uri)
             mlflow.set_experiment("murmur_model_training")
             self._mlflow = mlflow
             self.enabled = True
