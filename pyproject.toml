@@ -102,6 +102,11 @@ exclude_lines = [
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+# Claude Code checks agent worktrees out under .claude/worktrees/, which are
+# full copies of this repository. Without this, every lint run reports each
+# finding once per worktree and a stale branch can fail CI on code that is not
+# even on the current one.
+extend-exclude = [".claude"]
 
 [tool.ruff.lint]
 select = [

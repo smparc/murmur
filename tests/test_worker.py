@@ -96,14 +96,14 @@ class TestDegradedArray:
     """
 
     def _assembler(self, **kwargs):
-        defaults = dict(
-            num_nodes=4,
-            seq_length=8,
-            n_mels=settings.N_MELS,
-            staleness_tolerance=5.0,
-            max_wait=1.0,
-            min_nodes=2,
-        )
+        defaults = {
+            "num_nodes": 4,
+            "seq_length": 8,
+            "n_mels": settings.N_MELS,
+            "staleness_tolerance": 5.0,
+            "max_wait": 1.0,
+            "min_nodes": 2,
+        }
         return WindowAssembler(**{**defaults, **kwargs})
 
     def test_dead_microphone_releases_a_degraded_snapshot(self):

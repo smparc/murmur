@@ -37,6 +37,10 @@ mlartifacts/
 *.swo
 
 
+# Claude Code agent worktrees — full checkouts of this repo, never artifacts
+.claude/
+
+
 # OS
 .DS_Store
 Thumbs.db

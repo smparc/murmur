@@ -335,7 +335,7 @@ class Settings:
             )
         if self.ARRAY_MIN_NODES < 1:
             errors.append(f"ARRAY_MIN_NODES must be >= 1, got {self.ARRAY_MIN_NODES}")
-        if self.ARRAY_MIN_NODES > len(self.MIC_COORDS):
+        if len(self.MIC_COORDS) < self.ARRAY_MIN_NODES:
             errors.append(
                 f"ARRAY_MIN_NODES ({self.ARRAY_MIN_NODES}) exceeds the number of "
                 f"microphones ({len(self.MIC_COORDS)}); no snapshot could ever be released"
