@@ -54,6 +54,10 @@ dependencies = [
 # by the training and orchestration entrypoints.
 mlops = ["dagster>=1.6.0,<2.0", "mlflow>=2.9.2,<4.0"]
 cuda = ["pycuda>=2024.1"]
+# src/export/onnx_export.py degrades gracefully without these — torch.onnx
+# writes the graph unaided — but verification and INT8 quantization need them,
+# and nothing else declared what `python -m src.export.onnx_export` depends on.
+export = ["onnx>=1.15,<2.0", "onnxruntime>=1.17,<2.0"]
 dev = [
     "murmur[mlops]",
     "pytest>=7.4",
