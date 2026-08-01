@@ -84,6 +84,7 @@ def export_autoencoder(
 
 def verify_export(
     onnx_path: str | Path,
+    weights_path: str | Path | None = None,
     n_mels: int | None = None,
     time_frames: int = 16,
     tolerance: float = 1e-3,
@@ -94,6 +95,12 @@ def verify_export(
     Worth doing every time. Export silently changes semantics more often than is
     comfortable — adaptive pooling and interpolation, both used by this model,
     are common sources of divergence between opsets.
+
+    ``weights_path`` must be whatever was passed to :func:`export_autoencoder`.
+    Comparing against a freshly constructed model instead compares two different
+    random initialisations, so the check fails for reasons that have nothing to
+    do with the export and passes only when the tolerance is wide enough to be
+    meaningless.
     """
     try:
         import numpy as np
@@ -105,20 +112,30 @@ def verify_export(
     n_mels = n_mels or settings.N_MELS
     example = torch.randn(1, 1, n_mels, time_frames)
 
-    model = SpectrogramAutoencoder(n_mels=n_mels).eval()
-    # The exported file carries its own weights; compare against a model loaded
-    # from the same source if one was given, otherwise this only checks shapes.
+    model = SpectrogramAutoencoder(n_mels=n_mels)
+    if weights_path:
+        model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+    else:
+        log.warning(
+            "No weights supplied — the reference model is randomly initialised and "
+            "will not match the exported graph. Only the output shape is checked."
+        )
+    model.eval()
+
     with torch.no_grad():
         torch_out, _ = model(example)
 
-    session = onnxruntime.InferenceSession(
-        str(onnx_path), providers=["CPUExecutionProvider"]
-    )
+    session = onnxruntime.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     onnx_out = session.run(None, {"spectrogram": example.numpy()})[0]
 
     if onnx_out.shape != tuple(torch_out.shape):
         log.error("Shape mismatch: onnx %s vs torch %s", onnx_out.shape, tuple(torch_out.shape))
         return False
+
+    if not weights_path:
+        # Two unrelated random initialisations; a numeric comparison here would
+        # report a failure that says nothing about the export itself.
+        return True
 
     difference = float(np.abs(onnx_out - torch_out.numpy()).max())
     log.info("Max absolute difference: %.2e", difference)
@@ -175,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if not args.skip_verify:
-        verify_export(path, time_frames=args.time_frames)
+        verify_export(path, weights_path=args.weights, time_frames=args.time_frames)
     if args.quantize:
         quantize(path)
     return 0
