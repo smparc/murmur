@@ -164,7 +164,7 @@ def reconstruction_error_map(autoencoder, spectrogram: torch.Tensor) -> torch.Te
         raise ValueError(f"expected a 2-, 3- or 4-D spectrogram, got {spectrogram.dim()}-D")
 
     if x.size(0) != 1:
-        raise ValueError("explain one frame at a time; got a batch of %d" % x.size(0))
+        raise ValueError(f"explain one frame at a time; got a batch of {x.size(0)}")
 
     reconstruction, _ = autoencoder(x)
     return (reconstruction - x).pow(2).squeeze(0).squeeze(0)

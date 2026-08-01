@@ -21,8 +21,8 @@ already heavy enough without adding another.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 # The ranking statistics themselves live in src.evaluation.metrics — one
 # implementation, so there is one place for a rank or tie-handling bug to be.
@@ -41,8 +41,8 @@ __all__ = [
     "first_sustained_alarm",
     "format_table",
     "lead_time",
-    "roc_auc",
     "partial_roc_auc",
+    "roc_auc",
     "summarize",
 ]
 
@@ -105,7 +105,7 @@ def average_precision(scores: Sequence[float], labels: Sequence[int]) -> float:
     if n_pos == 0:
         return 0.0
 
-    paired = sorted(zip(scores, labels), key=lambda p: -p[0])
+    paired = sorted(zip(scores, labels, strict=True), key=lambda p: -p[0])
     tp = fp = 0
     prev_recall = 0.0
     ap = 0.0
@@ -177,7 +177,7 @@ def confusion_at_threshold(
 ) -> DetectionMetrics:
     """Confusion matrix for ``score >= threshold`` counting as a detection."""
     tp = fp = tn = fn = 0
-    for score, label in zip(scores, labels):
+    for score, label in zip(scores, labels, strict=True):
         predicted = score >= threshold
         if label and predicted:
             tp += 1

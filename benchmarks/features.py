@@ -43,9 +43,9 @@ def to_log_mel(
     blind to exactly the low-level spectral detail that distinguishes an early
     bearing fault from ordinary rumble.
     """
+    # `.copy()` because frombuffer yields a read-only view, and torch refuses to
+    # wrap non-writable memory without warning.
     if isinstance(audio, np.ndarray):
-        # `.copy()` because frombuffer yields a read-only view, and torch
-        # refuses to wrap non-writable memory without warning.
         waveform = torch.from_numpy(audio.copy())
     else:
         waveform = audio

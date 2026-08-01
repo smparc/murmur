@@ -31,8 +31,9 @@ import logging
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Protocol
+from typing import Literal, Protocol
 
 log = logging.getLogger(__name__)
 

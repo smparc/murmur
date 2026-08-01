@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-__all__ = ["Baseline", "DCASE2020_AUTOENCODER", "lookup"]
+__all__ = ["DCASE2020_AUTOENCODER", "Baseline", "lookup"]
 
 
 @dataclass(frozen=True)

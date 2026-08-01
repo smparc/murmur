@@ -25,8 +25,9 @@ on the floor, and no general catalogue substitutes for that.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Literal, Sequence
+from typing import Literal
 
 from src.explain.saliency import AnomalyExplanation
 
@@ -253,7 +254,7 @@ class FaultTaxonomy:
             return 0.0
 
         score = 0.0
-        for weight, band in zip(weights, explanation.bands):
+        for weight, band in zip(weights, explanation.bands, strict=True):
             score += math.sqrt((weight / total_weight) * band.share)
         return min(1.0, score)
 
