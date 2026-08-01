@@ -787,7 +787,14 @@ def train() -> dict[str, float]:
     )
 
     generator = torch.Generator().manual_seed(settings.SEED)
-    splits = train_val_test_split(x, y, ts, generator=generator)
+    # A larger test split than the usual 70/15/15, because only half of it
+    # calibrates and that half is then partitioned by severity. The middle
+    # `warning` band is roughly a tenth of the data, so a 300-sample calibration
+    # set puts it near `min_group_size` in expectation and below it on an
+    # unlucky draw — which silently demotes the band to the global radius. The
+    # 200 sequences this costs training are worth far less than group-conditional
+    # coverage in the band an operator actually schedules against.
+    splits = train_val_test_split(x, y, ts, train_ratio=0.65, val_ratio=0.15, generator=generator)
     log.info(
         "Split: train=%d val=%d test=%d",
         splits["train"][0].size(0),
