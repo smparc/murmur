@@ -385,9 +385,7 @@ class Settings:
                 f"TDOA_STALENESS_TOLERANCE must be > 0, got {self.TDOA_STALENESS_TOLERANCE}"
             )
         if self.ALERT_COOLDOWN_SECONDS < 0:
-            errors.append(
-                f"ALERT_COOLDOWN_SECONDS must be >= 0, got {self.ALERT_COOLDOWN_SECONDS}"
-            )
+            errors.append(f"ALERT_COOLDOWN_SECONDS must be >= 0, got {self.ALERT_COOLDOWN_SECONDS}")
         if self.ALERT_MIN_SEVERITY not in {"normal", "warning", "critical"}:
             errors.append(
                 f"ALERT_MIN_SEVERITY must be normal, warning or critical, "

@@ -122,18 +122,14 @@ class TestGroundedDiagnosis:
     }
 
     def test_evidence_is_echoed_to_the_client(self, api_client):
-        body = api_client.post(
-            "/generate_telemetry", json=_valid_payload(**self._EVIDENCE)
-        ).json()
+        body = api_client.post("/generate_telemetry", json=_valid_payload(**self._EVIDENCE)).json()
 
         assert body["diagnosis"]["fault"] == "Bearing race defect"
         assert body["explanation"]["bands"][0]["low_hz"] == 2100.0
 
     def test_templated_text_names_the_fault(self, api_client):
         """The LLM is optional; the templated path is what most sites run."""
-        body = api_client.post(
-            "/generate_telemetry", json=_valid_payload(**self._EVIDENCE)
-        ).json()
+        body = api_client.post("/generate_telemetry", json=_valid_payload(**self._EVIDENCE)).json()
 
         assert "Bearing race defect" in body["telemetry"]
         assert body["generated"] is False
