@@ -402,6 +402,56 @@ class TestInferenceWorker:
 
         assert all("explanation" not in p for p in payloads)
 
+    def test_no_sinks_configured_means_nobody_is_paged(self, worker):
+        """
+        An unconfigured deployment must route nowhere. Paging somebody because a
+        URL was lying around in the environment is worse than staying quiet.
+        """
+        assert worker.alerts.sinks == []
+
+        now = time.time()
+        for node in range(settings.NUM_NODES):
+            worker.handle_window(_window(node, now))  # must not raise
+
+    def test_alerts_reach_configured_sinks(self, worker):
+        """A prediction nobody sees changes nothing."""
+        from src.alerting.webhook import GenericWebhookSink
+
+        delivered: list[dict] = []
+
+        def transport(url, payload, headers):
+            delivered.append(payload)
+            return True
+
+        worker.alerts.sinks = [GenericWebhookSink("https://example.invalid", transport=transport)]
+        worker.alerts.min_severity = "normal"
+
+        now = time.time()
+        for node in range(settings.NUM_NODES):
+            worker.handle_window(_window(node, now))
+
+        assert delivered, "a configured sink must receive the scored frame"
+        assert {"node_id", "severity", "fault"} <= delivered[0].keys()
+
+    def test_a_wedged_webhook_does_not_stop_scoring(self, worker):
+        """Alerting is downstream of safety; it must never break the pipeline."""
+        from src.alerting.webhook import GenericWebhookSink
+
+        def exploding_transport(url, payload, headers):
+            raise RuntimeError("webhook is down")
+
+        worker.alerts.sinks = [
+            GenericWebhookSink("https://example.invalid", transport=exploding_transport)
+        ]
+        worker.alerts.min_severity = "normal"
+
+        now = time.time()
+        payloads: list[dict] = []
+        for node in range(settings.NUM_NODES):
+            payloads = worker.handle_window(_window(node, now)) or payloads
+
+        assert len(payloads) == settings.NUM_NODES
+
     def test_submit_survives_unreachable_api(self):
         w = InferenceWorker(inference_url="http://127.0.0.1:1", load_weights=False)
         try:
