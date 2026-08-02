@@ -68,9 +68,17 @@ error improves from $0.0608$ to $0.0313$ against a mean-predictor baseline of
 $0.2450$. Conformal coverage lands at $0.89$ against a nominal $0.90$ with mean
 interval width falling from $0.190$ to $0.119$, and all three severity strata
 receive their own radius for the first time, ordered $0.048 < 0.074 < 0.105$
-from normal to critical. I do not claim these numbers demonstrate acoustic fault
-detection. They are measured on a simulator, and Section~\ref{sec:notclaim}
-states precisely what that does and does not establish.
+from normal to critical.
+
+I then run the detector against recorded machine audio --- the DCASE 2020 Task 2
+pump set, four units, unsupervised, on the official split --- and the synthetic
+result does not transfer. Mean AUC is $0.7064$ against a published autoencoder
+baseline of $0.7289$, and mean pAUC at $p{=}0.1$ is $0.4061$ against $0.5999$.
+The shortfall is concentrated in precisely the low-false-alarm regime a plant
+would operate in. Per-unit AUC ranges from $0.6404$ to $0.8116$, so a
+single-unit evaluation would have supported almost any conclusion. That is the
+number I would quote, and it says a system scoring $0.9672$ on its own simulator
+is at best comparable to a standard baseline on real audio.
 \end{abstract}
 
 \tableofcontents
@@ -194,10 +202,12 @@ They are measured on different distributions. Where both appear in this paper it
 is to quantify the effect of the correction, never to suggest one model is
 better than another.
 
-Establishing real detection performance requires the public benchmarks the
-repository now contains harnesses for --- MIMII, DCASE, IMS --- run against
-recorded machine audio. That is the obvious next step and it is not attempted
-here.
+Section~\ref{sec:dcase} does evaluate on recorded machine audio, and that result
+carries its own limits. It covers one machine type (pump) from one corpus, and
+it exercises only the anomaly detector: DCASE is single-channel, so the graph
+network and the continuous-time forecaster --- the two components this
+architecture is actually distinguished by --- contribute nothing to that number
+and remain unvalidated outside the simulator.
 
 \section{Related Work}
 
@@ -603,6 +613,65 @@ correct remedy was a larger calibration set rather than a different model. I
 record this because the plausible mechanism and the actual one prescribed
 different fixes.
 
+\subsection{Recorded machine audio}
+\label{sec:dcase}
+
+Everything above measures Murmur against material Murmur generated. This
+subsection does not.
+
+The DCASE 2020 Task 2 development set contains ten-second recordings of
+industrial machines under normal and anomalous operation, with a fixed official
+split: training data is normal-only by construction, since the task is
+unsupervised detection and a system that saw labelled anomalies during training
+would not be reporting a comparable number. I evaluate on the pump subset ---
+$3{,}349$ normal training clips and $856$ test clips ($400$ normal, $456$
+anomalous) across four physical units --- training a fresh autoencoder per unit
+for $20$ epochs at seed $1337$.
+
+Only the anomaly detector is under test here. DCASE audio is single-channel, so
+there is no microphone array, no graph, and no time-of-arrival structure: the
+ST-GNN and the liquid network are not exercised at all. What this measures is
+the autoencoder and the robust scorer, which is the component the DCASE baseline
+is also built from and therefore the only one that can be compared.
+
+\begin{center}
+\begin{tabular}{lrrrr}
+\toprule
+Unit & AUC & pAUC@10\% & AP & Baseline AUC \\
+\midrule
+pump/id\_00 & 0.8116 & 0.6371 & 0.8996 & 0.7289 \\
+pump/id\_02 & 0.6948 & 0.3811 & 0.7773 & 0.7289 \\
+pump/id\_04 & 0.6787 & 0.2620 & 0.7153 & 0.7289 \\
+pump/id\_06 & 0.6404 & 0.3441 & 0.7257 & 0.7289 \\
+\midrule
+\textbf{Mean} & \textbf{0.7064} & \textbf{0.4061} & 0.7795 & 0.7289 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Mean AUC of $0.7064$ sits $0.0225$ below the published DCASE 2020 autoencoder
+baseline of $0.7289$. Mean pAUC at $p{=}0.1$ is $0.4061$ against a baseline of
+$0.5999$, a shortfall of $0.194$ --- and pAUC is the metric that matters
+operationally, because it integrates only over the low-false-positive region
+where a plant would actually set its threshold. A system that fires on ten
+percent of healthy pumps has already been muted by its operators.
+
+Two things deserve emphasis. First, per-unit AUC spans $0.6404$ to $0.8116$;
+reporting id\_00 alone would have suggested the system beats the baseline by
+eight points, and reporting id\_06 alone that it loses by nine. Second, and more
+importantly, the same detector scores $\mathrm{F}_1 = 0.9672$ on the corrected
+simulator. The simulator was made harder in Section~\ref{sec:data} and remains
+far easier than a real pump. A generator is a statement of its author's
+assumptions, and this is the measurement of how much those assumptions were
+worth.
+
+The comparison carries two caveats. The baseline figures are transcribed from
+the DCASE 2020 results and should be verified against the official page before
+being cited. More substantively, the harness compares each \emph{unit} against
+the \emph{machine-type} aggregate baseline, so the per-row deltas are not
+strictly like-for-like; only the mean row is a fair comparison, and only against
+the pump aggregate.
+
 \section{The Artifact}
 \label{sec:artifact}
 
@@ -700,11 +769,28 @@ first time --- revealing that intervals on critical forecasts had been
 approximately twice too narrow, concealed behind an apparently healthy marginal
 coverage figure.
 
-The system does not yet demonstrate acoustic fault detection, and this paper
-does not claim it does. What it provides is a pipeline in which such a claim
-could be honestly evaluated: the measurement protocol is corrected, the
-uncertainty quantification does what it advertises in the regime that matters,
-and the benchmark harnesses against recorded machine audio are present and
-tested. Running them is the next step.
+On recorded pump audio the corrected detector reaches a mean AUC of $0.7064$
+against a published baseline of $0.7289$, and a mean pAUC of $0.4061$ against
+$0.5999$. It does not beat a standard autoencoder baseline, and it is furthest
+behind in the low-false-alarm regime that determines whether an alerting system
+survives contact with the people it pages. I regard obtaining that number as the
+more valuable outcome than the number itself: the gap between $0.9672$ on the
+simulator and $0.71$ on real audio is the quantity the earlier reported
+$\mathrm{F}_1 = 1.000$ was concealing, and it is now measured rather than
+assumed.
+
+What this work provides is a pipeline whose claims can be checked: the
+measurement protocol is corrected, the uncertainty quantification does what it
+advertises in the regime that matters, and performance on real machine audio is
+established rather than asserted --- including where it falls short.
+
+The obvious next steps follow from the gap. The spatial and temporal components
+are untested on real data, because DCASE is single-channel and no public corpus
+provides a synchronised industrial microphone array; producing one, or
+evaluating on MIMII's multi-channel recordings, would exercise the parts of the
+architecture the pump result leaves entirely unmeasured. And the pAUC shortfall
+is the concrete target: a detector at $0.41$ where the baseline reaches $0.60$
+has a specific, measurable deficiency in the only operating region that
+matters.
 
 \end{document}
