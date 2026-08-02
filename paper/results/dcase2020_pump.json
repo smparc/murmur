@@ -1,0 +1,64 @@
+{
+  "dataset": "dcase",
+  "root": "C:\\Users\\smpar\\AppData\\Local\\murmur-data\\dcase",
+  "per_group": {
+    "pump/id_00": {
+      "auc": 0.8116083916083916,
+      "pauc_10": 0.6370629370629372,
+      "average_precision": 0.8996194128155011,
+      "train_samples": 906,
+      "test_samples": 243,
+      "anomaly_rate": 0.588477366255144,
+      "machine_type": "pump",
+      "baseline_auc": 0.7289,
+      "baseline_pauc": 0.5999,
+      "baseline_system": "DCASE 2020 Task 2 baseline (autoencoder)",
+      "auc_vs_baseline": 0.08270839160839161
+    },
+    "pump/id_02": {
+      "auc": 0.6947747747747748,
+      "pauc_10": 0.3810810810810811,
+      "average_precision": 0.7772521092952384,
+      "train_samples": 905,
+      "test_samples": 211,
+      "anomaly_rate": 0.5260663507109005,
+      "machine_type": "pump",
+      "baseline_auc": 0.7289,
+      "baseline_pauc": 0.5999,
+      "baseline_system": "DCASE 2020 Task 2 baseline (autoencoder)",
+      "auc_vs_baseline": -0.03412522522522521
+    },
+    "pump/id_04": {
+      "auc": 0.6787,
+      "pauc_10": 0.262,
+      "average_precision": 0.7153478589287152,
+      "train_samples": 602,
+      "test_samples": 200,
+      "anomaly_rate": 0.5,
+      "machine_type": "pump",
+      "baseline_auc": 0.7289,
+      "baseline_pauc": 0.5999,
+      "baseline_system": "DCASE 2020 Task 2 baseline (autoencoder)",
+      "auc_vs_baseline": -0.05020000000000002
+    },
+    "pump/id_06": {
+      "auc": 0.6403921568627451,
+      "pauc_10": 0.3441176470588235,
+      "average_precision": 0.7257288034765317,
+      "train_samples": 936,
+      "test_samples": 202,
+      "anomaly_rate": 0.504950495049505,
+      "machine_type": "pump",
+      "baseline_auc": 0.7289,
+      "baseline_pauc": 0.5999,
+      "baseline_system": "DCASE 2020 Task 2 baseline (autoencoder)",
+      "auc_vs_baseline": -0.0885078431372549
+    }
+  },
+  "mean_auc": 0.7063688308114779,
+  "mean_pauc_10": 0.4060654163007104,
+  "groups_scored": 4,
+  "epochs": 20,
+  "seed": 1337,
+  "elapsed_s": 87.9
+}
