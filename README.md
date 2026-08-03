@@ -85,7 +85,7 @@ scored telemetry to the API.
 | **CI/CD** | GitHub Actions | Lint, format, tests on 3 Python versions, Kafka integration, frontend build, manifest validation, image publish. |
 | **Frontend** | React, Next.js, Recharts | Per-node forecast series, exponential-backoff reconnect, staleness indicators. |
 | **Benchmarking** | MIMII / ToyADMOS | Scores the production detector on recorded machine faults; AUC and pAUC per machine type. |
-| **Testing** | pytest | 249 tests across models, detection, localization, calibration, ingestion, worker, API, auth and configuration. |
+| **Testing** | pytest | 452 tests across models, detection, localization, calibration, ingestion, worker, API, auth and configuration. |
 
 ---
 
@@ -120,7 +120,7 @@ murmur/
 │   ├── observability/metrics.py       # Prometheus metrics
 │   ├── training/train_pipeline.py     # Four-stage training + conformal calibration
 │   └── translation/llm_decoder.py     # FastAPI + WebSocket telemetry service
-└── tests/                             # 249 unit + integration tests
+└── tests/                             # 452 unit + integration tests
 ```
 
 ---
