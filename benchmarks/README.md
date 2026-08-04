@@ -28,16 +28,19 @@ Current result with **no trained autoencoder** (frame-energy fallback), 4 nodes
 
 | Metric | Value |
 | :-- | --: |
-| ROC AUC | 0.919 |
-| pAUC @ 10% FPR | 0.788 |
-| Average precision | 0.906 |
-| Precision / Recall | 0.995 / 0.685 |
+| ROC AUC | 0.9344 |
+| pAUC @ 10% FPR | 0.8369 |
+| Average precision | 0.9249 |
+| Precision / Recall | 0.9959 / 0.7571 |
 | False alarms per hour | 10.5 |
 | Events detected | 4 / 4 |
-| Mean lead time | 26.6 s |
-| Mean detection delay | 13.5 s |
+| Mean lead time | 29.6 s |
+| Mean detection delay | 10.5 s |
 
-Reproduce with `python -m benchmarks.evaluate_synthetic --frames 300`.
+Reproduce with `python -m benchmarks.evaluate_synthetic --frames 300`. The run is
+deterministic at a fixed seed, so these are exact rather than approximate. Note the
+default is `--frames 400`, which scores a longer run and reports different figures;
+the table above is the 300-frame invocation.
 
 > These are synthetic faults whose spectral signatures were written by hand in
 > `mock_edge_device.py`. Strong numbers here show the pipeline works. They are
