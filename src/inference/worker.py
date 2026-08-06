@@ -173,15 +173,25 @@ class WindowAssembler:
         beats letting ``assemble`` raise on every subsequent snapshot — that
         turns a fixable configuration error into an unbounded error log.
         """
-        actual = window.features.shape[0]
-        if actual != self.seq_length:
+        # Both arrays are checked, not just the features. `assemble` averages
+        # the timespans across reporting nodes, and numpy raises on a ragged
+        # stack — so a node whose timespans length disagrees would break every
+        # subsequent snapshot with a traceback from deep inside assemble,
+        # instead of the one clear diagnostic the features path already gives.
+        for field, actual in (
+            ("features", window.features.shape[0]),
+            ("timespans", window.timespans.shape[0]),
+        ):
+            if actual == self.seq_length:
+                continue
             if window.node_id not in self._bad_shape_logged:
                 self._bad_shape_logged.add(window.node_id)
                 log.error(
-                    "Node %s sent a %d-step window but SEQ_LENGTH is %d. The ingestion "
+                    "Node %s sent %s of length %d but SEQ_LENGTH is %d. The ingestion "
                     "service and the worker disagree on window length; align SEQ_LENGTH "
                     "across both. Further windows from this node are dropped silently.",
                     window.node_id,
+                    field,
                     actual,
                     self.seq_length,
                 )
@@ -526,8 +536,17 @@ class InferenceWorker:
         node_embeddings = node_sequence.mean(dim=1).squeeze(0).cpu()  # (N, E)
         ttf_by_node = node_ttf.squeeze(0).cpu().tolist()
 
+        # A position is attached only when the array geometry supports it.
+        #
+        # `source_position` becomes the alert's `location` — the coordinates an
+        # engineer walks to. Near the array centroid the hyperbolas are nearly
+        # parallel, so the solve is ill-conditioned and the fix can be over a
+        # metre out while reporting a residual of ~0; the residual cannot detect
+        # this because the system is exactly determined and fits perfectly
+        # either way. GDOP can, so an unreliable fix is dropped from the payload
+        # rather than sent to the shop floor as a location.
         source_position = None
-        if self.spatial is not None:
+        if self.spatial is not None and self.spatial.get("position_reliable", True):
             source_position = self.spatial.get("position")
 
         payloads: list[dict] = []

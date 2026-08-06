@@ -34,7 +34,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from src.mapping.tdoa import SPEED_OF_SOUND, TDOAEstimate, localize_source, pairwise_tdoa
+from src.mapping.tdoa import (
+    GDOP_UNRELIABLE,
+    SPEED_OF_SOUND,
+    TDOAEstimate,
+    localize_source,
+    pairwise_tdoa,
+)
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +55,8 @@ class SpatialSnapshot:
     residual: float
     clock_spread: float
     """Seconds between the earliest and latest contributing chunk."""
+    gdop: float = float("inf")
+    """Geometric dilution of precision for this fix. See :func:`position_gdop`."""
 
     @property
     def mean_coherence(self) -> float:
@@ -59,6 +67,19 @@ class SpatialSnapshot:
     @property
     def localized(self) -> bool:
         return self.position is not None
+
+    @property
+    def position_reliable(self) -> bool:
+        """Whether the array geometry actually supports this position.
+
+        Distinct from ``localized``, and the distinction matters operationally:
+        a source near the array centroid solves cleanly, reports a residual of
+        ~0, and can still be more than a metre out, because the hyperbolas being
+        intersected there are nearly parallel. That position reaches the
+        dashboard and the alert payload as the machine an engineer should go and
+        inspect, so shipping it unqualified sends them to the wrong one.
+        """
+        return self.localized and np.isfinite(self.gdop) and self.gdop <= GDOP_UNRELIABLE
 
     def coherence_map(self) -> dict[tuple[int, int], float]:
         out: dict[tuple[int, int], float] = {}
@@ -74,6 +95,8 @@ class SpatialSnapshot:
             "clock_spread": float(self.clock_spread),
             "mean_coherence": self.mean_coherence,
             "residual": float(self.residual) if np.isfinite(self.residual) else None,
+            "gdop": float(self.gdop) if np.isfinite(self.gdop) else None,
+            "position_reliable": bool(self.position_reliable),
             "position": None if self.position is None else [float(v) for v in self.position],
             "pairs": [
                 {
@@ -185,7 +208,7 @@ class SpatialProbe:
             interp=self.interp,
             speed=self.speed,
         )
-        position, residual = localize_source(
+        fix = localize_source(
             estimates,
             self.mic_coords,
             speed=self.speed,
@@ -196,10 +219,19 @@ class SpatialProbe:
         snapshot = SpatialSnapshot(
             timestamp=max(c.timestamp for c in ordered),
             estimates=estimates,
-            position=position,
-            residual=residual,
+            position=fix.position,
+            residual=fix.residual,
+            gdop=fix.gdop,
             clock_spread=spread,
         )
+
+        if fix.position is not None and not fix.reliable:
+            log.debug(
+                "Source fix has GDOP %.1f (> %.1f) — the geometry does not support "
+                "this position; it is published flagged rather than dropped.",
+                fix.gdop,
+                GDOP_UNRELIABLE,
+            )
 
         if spread > self.staleness_tolerance / 2:
             log.debug(

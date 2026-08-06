@@ -83,6 +83,40 @@ class TestWindowAssembler:
         assembler.clear()
         assert not assembler.is_complete()
 
+    def test_a_mismatched_features_length_is_rejected_at_the_door(self):
+        assembler = WindowAssembler(num_nodes=2, seq_length=4, n_mels=settings.N_MELS)
+        assert not assembler.push(_window(0, 100.0, seq=8))
+        assert not assembler.is_complete()
+
+    def test_a_mismatched_timespans_length_is_rejected_too(self):
+        """Both arrays are indexed by seq_length, so both must be checked.
+
+        `assemble` averages timespans across the reporting nodes and numpy
+        raises on a ragged stack. Letting a bad-length timespans array through
+        `push` moves the failure from one clear diagnostic here to a traceback
+        from inside `assemble` on every subsequent snapshot, forever.
+        """
+        assembler = WindowAssembler(num_nodes=2, seq_length=4, n_mels=settings.N_MELS)
+        window = _window(0, 100.0, seq=4)
+        window.timespans = np.full(7, 0.5, dtype=np.float32)
+
+        assert not assembler.push(window)
+        assert not assembler.is_complete()
+
+    def test_assemble_never_sees_ragged_timespans(self):
+        """End-to-end: the guard above must keep `assemble` safe."""
+        assembler = WindowAssembler(num_nodes=2, seq_length=4, n_mels=settings.N_MELS)
+        good = _window(0, 100.0, seq=4)
+        bad = _window(1, 100.0, seq=4)
+        bad.timespans = np.full(9, 0.5, dtype=np.float32)
+
+        assembler.push(good)
+        assembler.push(bad)
+        # Only the well-formed node was buffered, so this cannot raise.
+        _, timespans, snapshot = assembler.assemble()
+        assert set(snapshot) == {0}
+        assert timespans.shape == (1, 4)
+
 
 class TestDegradedArray:
     """

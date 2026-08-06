@@ -85,7 +85,7 @@ scored telemetry to the API.
 | **CI/CD** | GitHub Actions | Lint, format, tests on 3 Python versions, Kafka integration, frontend build, manifest validation, image publish. |
 | **Frontend** | React, Next.js, Recharts | Per-node forecast series, exponential-backoff reconnect, staleness indicators. |
 | **Benchmarking** | MIMII / ToyADMOS | Scores the production detector on recorded machine faults; AUC and pAUC per machine type. |
-| **Testing** | pytest | 452 tests across models, detection, localization, calibration, ingestion, worker, API, auth and configuration. |
+| **Testing** | pytest | 459 tests across models, detection, localization, calibration, ingestion, worker, API, auth and configuration. |
 
 ---
 
@@ -120,7 +120,7 @@ murmur/
 │   ├── observability/metrics.py       # Prometheus metrics
 │   ├── training/train_pipeline.py     # Four-stage training + conformal calibration
 │   └── translation/llm_decoder.py     # FastAPI + WebSocket telemetry service
-└── tests/                             # 452 unit + integration tests
+└── tests/                             # 459 unit + integration tests
 ```
 
 ---
@@ -284,7 +284,18 @@ The graph the ST-GNN convolves over was originally *static* — edges weighted p
 `src/mapping/tdoa.py` recovers the missing signal from the multi-channel audio itself:
 
 1. **GCC-PHAT** cross-correlates each microphone pair, dividing out the magnitude spectrum so only phase contributes. Plain cross-correlation is dominated by the 50/60 Hz mains rumble every channel shares, which peaks at zero lag no matter where the machine is. The phase transform is what makes the estimate survive a factory floor.
-2. **Hyperbolic localization** (Chan-Ho linear least squares) intersects the per-pair delay hyperboloids to fix the source in space. On the reference 4-mic array, a noiseless broadband source resolves to a **median of ~7 cm** across the floor — a few centimetres at the positions the test suite pins, degrading sharply near the array centroid, where the hyperbolas become nearly parallel and the solve is ill-conditioned. The worst case measured there exceeds a metre, and the residual does *not* flag it: a degenerate solve still reports ~0. The suite asserts `< 0.5 m`, which is the honest bound; treat sub-decimetre accuracy as a best case away from the centroid, not a specification.
+2. **Hyperbolic localization** (Chan-Ho linear least squares) intersects the per-pair delay hyperboloids to fix the source in space. On the reference 4-mic array, a noiseless broadband source resolves to a **median of ~7 cm** across the floor — a few centimetres at the positions the test suite pins, degrading sharply near the array centroid, where the hyperbolas become nearly parallel and the solve is ill-conditioned.
+
+   **The residual cannot detect that, so every fix now carries a GDOP.** With four microphones and three unknowns the system is exactly determined, so it fits perfectly whatever the geometry — measured across the floor, a source at the circumcentre produces a residual of `2.3e-14` against `3.4e-14` for a well-conditioned fix out near the microphones. The residual is not merely uninformative there; it points the wrong way. Geometric dilution of precision measures the conditioning the residual is blind to:
+
+   | source | error | residual | GDOP | verdict |
+   |---|---:|---:|---:|---|
+   | (3.5, 7.0) | 0.032 m | 3.4e-14 | 1.12 | reliable |
+   | (1.0, 1.0) | 0.000 m | 9.2e-15 | 0.76 | reliable |
+   | centroid | 0.000 m | 2.3e-14 | ∞ | **unreliable** |
+   | centroid + 5 cm | 0.072 m | 2.5e-03 | 6.5e6 | **unreliable** |
+
+   Reproduce with `python -m src.mapping.tdoa`. `SourceFix.reliable` gates on `GDOP <= 10` — the conventional GNSS cutoff, which lands in the right place here — and the worker **omits** `source_position` from the telemetry payload when the fix is unreliable rather than shipping it. That field becomes the alert's `location`: the coordinates an engineer walks to. A confidently wrong one sends them to the wrong machine, which is worse than sending them nothing.
 3. **Dynamic edge weighting** multiplies the geometric weight by measured coherence, so the graph re-partitions itself around whatever is actually making noise. Decoupled pairs are *attenuated toward a floor, never severed* — a zero-weight graph collapses the GCN into a per-node MLP.
 
 Because the mel transform discards phase, this has to run in the **ingestion** service on raw waveforms (`src/ingestion/spatial_probe.py`), and is published on `<PROCESSED_TOPIC>-spatial` for the worker to consume.

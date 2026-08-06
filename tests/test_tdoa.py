@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from src.mapping.tdoa import (
+    GDOP_UNRELIABLE,
     SPEED_OF_SOUND,
     TDOAEstimate,
     gcc_phat,
@@ -172,6 +173,63 @@ class TestLocalization:
     def test_channel_count_must_match_coords(self):
         with pytest.raises(ValueError):
             pairwise_tdoa(np.zeros((3, 100)), self.COORDS, FS)
+
+    # -- geometry quality --------------------------------------------------
+
+    def _fix(self, source):
+        channels = _simulate_array(source, self.COORDS)
+        estimates = pairwise_tdoa(channels, self.COORDS, FS)
+        return localize_source(estimates, self.COORDS, plane_z=3.0)
+
+    def test_the_residual_cannot_detect_a_degenerate_geometry(self):
+        """Why GDOP exists: the residual is blind to conditioning.
+
+        With four microphones and three unknowns the system is exactly
+        determined, so it fits perfectly whatever the geometry. A source at the
+        array circumcentre — an entirely ordinary place for a machine to sit —
+        therefore produces a residual indistinguishable from, and here actually
+        *smaller* than, a well-conditioned fix out near the microphones.
+        """
+        good = self._fix((3.5, 7.0, 3.0))
+        centroid = tuple(self.COORDS.mean(axis=0))
+        degenerate = self._fix(centroid)
+
+        assert good.residual < 1e-6
+        assert degenerate.residual < 1e-6
+        # The residual gives the caller nothing to discriminate on.
+        assert abs(good.residual - degenerate.residual) < 1e-6
+
+    def test_gdop_flags_what_the_residual_misses(self):
+        good = self._fix((3.5, 7.0, 3.0))
+        centroid = self.COORDS.mean(axis=0)
+        # Just off the exact centroid, where the hyperbolas are near-parallel
+        # but the matrix is not exactly singular.
+        near_centroid = self._fix(tuple(centroid + np.array([0.05, 0.05, 0.0])))
+
+        assert good.reliable
+        assert good.gdop < GDOP_UNRELIABLE
+        assert not near_centroid.reliable
+        assert near_centroid.gdop > good.gdop
+
+    def test_gdop_is_finite_and_small_for_well_placed_sources(self):
+        for source in [(1.0, 1.0, 3.0), (3.5, 7.0, 3.0), (4.0, 2.0, 3.0)]:
+            fix = self._fix(source)
+            assert np.isfinite(fix.gdop), source
+            assert fix.gdop < GDOP_UNRELIABLE, (source, fix.gdop)
+            assert fix.reliable, source
+
+    def test_an_unlocalised_fix_is_never_reliable(self):
+        estimates = [TDOAEstimate(i=0, j=1, tau=0.0, coherence=1.0, max_tau=0.02)]
+        fix = localize_source(estimates, self.COORDS, plane_z=3.0)
+        assert fix.position is None
+        assert not fix.reliable
+        assert fix.gdop == float("inf")
+
+    def test_fix_still_unpacks_as_the_original_pair(self):
+        """The two-value contract predates the geometry field and still holds."""
+        position, residual = self._fix((3.5, 7.0, 3.0))
+        assert position is not None
+        assert residual < 1.0
 
     def test_rejects_non_2d_channels(self):
         with pytest.raises(ValueError):

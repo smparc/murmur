@@ -193,13 +193,87 @@ def pairwise_tdoa(
     return estimates
 
 
+# Position GDOP above which a fix is not trustworthy.
+#
+# GDOP is dimensionless: it is the factor by which delay noise is amplified into
+# position error. On the reference 4-mic array a well-conditioned fix out near
+# the microphones sits around 1-3; the value climbs without bound as the source
+# approaches the circumcentre, where every hyperbola becomes tangent and the
+# geometry stops distinguishing nearby positions at all. 10 is the conventional
+# GNSS cutoff between "fair" and "poor", and it lands in the right place here.
+GDOP_UNRELIABLE = 10.0
+
+
+@dataclass(frozen=True)
+class SourceFix:
+    """A localisation result, with the geometry quality that produced it."""
+
+    position: np.ndarray | None
+    residual: float
+    gdop: float
+    n_pairs: int
+
+    @property
+    def reliable(self) -> bool:
+        """Whether the geometry supports the position at all.
+
+        Deliberately *not* a function of the residual. With four microphones and
+        three unknowns the system is exactly determined, so it fits perfectly
+        whatever the geometry — a source at the array centroid produces a
+        residual of ~0 and a position that can be a metre wrong. Conditioning is
+        the quantity that distinguishes them, and the residual cannot see it.
+        """
+        return self.position is not None and np.isfinite(self.gdop) and self.gdop <= GDOP_UNRELIABLE
+
+    def __iter__(self):
+        """Unpack as ``(position, residual)``.
+
+        Kept so the original two-value contract still works at call sites that
+        do not care about geometry quality.
+        """
+        return iter((self.position, self.residual))
+
+
+def position_gdop(design: np.ndarray, position_dims: int) -> float:
+    """
+    Geometric dilution of precision for a linearised TDOA solve.
+
+    For ``A x = b`` with i.i.d. delay noise of variance ``s^2``, the estimate's
+    covariance is ``s^2 (A^T A)^-1``; GDOP is the root of the trace of that
+    inverse restricted to the position block. It answers "how much does a metre
+    of ranging error become, in metres of position error, at this geometry".
+
+    This is the measurement the residual cannot supply. Two sources, one near a
+    microphone and one at the array circumcentre, can both produce a residual of
+    zero — the system is exactly determined in both cases — while the second has
+    a position uncertainty an order of magnitude larger, because the hyperbolas
+    it is intersecting are nearly parallel there. GDOP is exactly the ratio of
+    those uncertainties.
+
+    Returns ``inf`` for a singular design matrix.
+    """
+    gram = design.T @ design
+    try:
+        covariance = np.linalg.inv(gram)
+    except np.linalg.LinAlgError:
+        return float("inf")
+
+    trace = float(np.trace(covariance[:position_dims, :position_dims]))
+    if not np.isfinite(trace) or trace < 0.0:
+        return float("inf")
+    # The design matrix carries a factor of 2 on every position column (see the
+    # Chan-Ho rows below), so the raw covariance is scaled by 1/4. Undo it, so a
+    # GDOP of 1 means "delay error passes through unamplified".
+    return float(2.0 * np.sqrt(trace))
+
+
 def localize_source(
     estimates: list[TDOAEstimate],
     mic_coords: np.ndarray | list[tuple[float, float, float]],
     speed: float = SPEED_OF_SOUND,
     plane_z: float | None = None,
     min_coherence: float = 0.05,
-) -> tuple[np.ndarray | None, float]:
+) -> SourceFix:
     """
     Solve for the source position from a set of pairwise delays.
 
@@ -221,19 +295,31 @@ def localize_source(
     real limitation of the array, not of the estimator; it is stated here rather
     than papered over with a plausible-looking but arbitrary z.
 
+    Conditioning
+    ------------
+    Accuracy is strongly position-dependent and the residual does not reveal it.
+    Near the array centroid the hyperbolas are nearly parallel, the solve is
+    ill-conditioned, and the fix can be more than a metre out while still
+    reporting a residual of ~0 — because with four microphones and three
+    unknowns the system is exactly determined and fits perfectly regardless.
+    Every fix therefore carries a ``gdop``, and ``SourceFix.reliable`` gates on
+    it. A confidently wrong position is worse than no position on a system whose
+    output tells an engineer which machine to go and inspect.
+
     Returns
     -------
-    ``(position, residual)``. ``position`` is ``(3,)`` in metres, or ``None``
-    when too few usable delays survive the coherence filter. ``residual`` is the
-    RMS of the linear system, useful as a goodness-of-fit gate.
+    :class:`SourceFix`. Unpacks as ``(position, residual)`` for callers that
+    predate the geometry quality field.
     """
     coords = np.asarray(mic_coords, dtype=np.float64)
     if coords.ndim != 2 or coords.shape[1] != 3:
         raise ValueError(f"mic_coords must be (N, 3), got {coords.shape}")
 
+    unusable = SourceFix(position=None, residual=float("inf"), gdop=float("inf"), n_pairs=0)
+
     usable = [e for e in estimates if e.coherence >= min_coherence and not e.saturated]
     if not usable:
-        return None, float("inf")
+        return unusable
 
     # Re-reference every delay to a common anchor: the microphone appearing in
     # the most usable pairs, which is the best-observed node in this snapshot.
@@ -275,7 +361,7 @@ def localize_source(
     position_dims = 3 if solve_z else 2
     unknowns = position_dims + 1  # + the anchor range r_0
     if len(rows) < unknowns:
-        return None, float("inf")
+        return unusable
 
     A = np.vstack(rows)
     b = np.asarray(rhs)
@@ -291,7 +377,7 @@ def localize_source(
     if np.linalg.matrix_rank(A[:, :position_dims]) < position_dims:
         # Genuinely degenerate: a collinear array, or a coplanar one asked for
         # a 3-D fix.
-        return None, float("inf")
+        return unusable
 
     # lstsq returns the minimum-norm solution, which resolves the position block
     # correctly even when the r_0 column carries no information.
@@ -299,7 +385,12 @@ def localize_source(
 
     residual = float(np.sqrt(np.mean((A @ solution - b) ** 2)))
     position = solution[:3] if solve_z else np.array([solution[0], solution[1], float(plane_z)])
-    return position, residual
+    return SourceFix(
+        position=position,
+        residual=residual,
+        gdop=position_gdop(A, position_dims),
+        n_pairs=len(rows),
+    )
 
 
 def tdoa_edge_weights(
@@ -384,13 +475,45 @@ def main() -> None:  # pragma: no cover - manual inspection helper
     channels = np.stack(channels)
 
     estimates = pairwise_tdoa(channels, coords, fs)
-    position, residual = localize_source(estimates, coords, plane_z=float(coords[:, 2].mean()))
+    fix = localize_source(estimates, coords, plane_z=float(coords[:, 2].mean()))
 
     print(f"[*] True source:      {source}")
-    print(f"[*] Estimated source: {position}")
-    print(f"[*] Residual:         {residual:.4f}")
+    print(f"[*] Estimated source: {fix.position}")
+    print(f"[*] Error:            {np.linalg.norm(fix.position - source):.3f} m")
+    print(f"[*] Residual:         {fix.residual:.4f}")
+    print(f"[*] GDOP:             {fix.gdop:.2f}  ({'reliable' if fix.reliable else 'UNRELIABLE'})")
     for e in estimates:
         print(f"    mic {e.i}-{e.j}: tau={e.tau * 1e3:+.3f} ms  coherence={e.coherence:.3f}")
+
+    # The point of GDOP in one comparison: the residual is ~0 at both positions,
+    # but only one of them is a position worth acting on.
+    print("\n[*] Accuracy vs. geometry across the floor:")
+    print(f"    {'source':>22}  {'error':>8}  {'residual':>10}  {'GDOP':>7}  verdict")
+    centroid = coords.mean(axis=0)
+    probes = [source, np.array([1.0, 1.0, 3.0]), centroid, centroid + np.array([0.05, 0.05, 0.0])]
+    for probe in probes:
+        chans = np.stack(
+            [
+                signal[
+                    round(np.linalg.norm(probe - p) / SPEED_OF_SOUND * fs) : round(
+                        np.linalg.norm(probe - p) / SPEED_OF_SOUND * fs
+                    )
+                    + n
+                ]
+                for p in coords
+            ]
+        )
+        f = localize_source(
+            pairwise_tdoa(chans, coords, fs), coords, plane_z=float(coords[:, 2].mean())
+        )
+        if f.position is None:
+            print(f"    {np.round(probe, 2)!s:>22}  {'-':>8}  {'-':>10}  {'-':>7}  no fix")
+            continue
+        error = float(np.linalg.norm(f.position - probe))
+        print(
+            f"    {np.round(probe, 2)!s:>22}  {error:>7.3f}m  {f.residual:>10.2e}  "
+            f"{f.gdop:>7.2f}  {'reliable' if f.reliable else 'UNRELIABLE'}"
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
