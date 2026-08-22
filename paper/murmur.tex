@@ -30,63 +30,38 @@ Maintenance}}
 \begin{abstract}
 \noindent
 Industrial acoustic monitoring promises to detect mechanical failure before it
-occurs, from sound alone. Murmur is a system built for that task: an array of
-microphones feeds a spatio-temporal graph neural network over an
-inverse-distance acoustic topology, whose per-timestep embeddings drive a
-continuous-time liquid network that forecasts time-to-failure, with a
-convolutional autoencoder scoring per-node anomalies against each microphone's
-own rolling baseline.
+occurs, from sound alone. Murmur is a system built for that task: microphones
+feed a spatio-temporal graph neural network over an acoustic topology, whose
+embeddings drive a continuous-time liquid network forecasting time-to-failure,
+with a convolutional autoencoder scoring per-node anomalies against each
+microphone's own rolling baseline.
 
-This paper reports an audit of that codebase and a substantially corrected
-system. The codebase is unusual in one respect that turns out to matter: it was
-built by three independent coding agents working concurrently in the same
-repository. That produced a specific and reproducible failure pattern. Two
-agents implemented acoustic localisation twice and an evaluation harness twice;
-one of each survived. Six commits of finished work --- source localisation,
-public-dataset benchmarking, anomaly explainability, and a fault taxonomy ---
-were stranded on an unmerged branch, and two further modules, webhook alerting
-and ONNX export, existed only as untracked files inside an agent worktree and
-would have been destroyed by a routine cleanup. An audit performed by one agent
-correctly identified eleven defects and, having been placed in a read-only role,
-fixed none of them; all eleven were still live.
+This paper audits that codebase, built by three independent coding agents
+working concurrently, and reports a substantially corrected system.
+Concurrency produced a specific failure pattern: acoustic localisation and an
+evaluation harness were each implemented twice; six commits of finished work
+were stranded on an unmerged branch, and two further modules existed only as
+untracked files a routine worktree cleanup would have destroyed. A prior
+read-only audit correctly identified eleven defects and fixed none of them.
 
-The most consequential finding is not a crash. The system reported a
-time-to-failure $\mathrm{F}_1$ of $1.000$. That figure was an artifact of the
-data generator: fault severity was drawn from $U(0.5, 1.0)$ while healthy
-sequences sat below $0.1$, leaving a $0.4$-wide interval containing no examples,
-with the $0.5$ decision threshold sitting inside it. The classes were separable
-by construction. The same draw confined the middle severity band to a sliver,
-starving the per-group conformal calibration that exists specifically to hold
-coverage in the high-risk strata --- so the one guarantee aimed at the regime an
-operator acts in was the one silently disabled.
+The most consequential finding was not a crash but a measurement. A reported
+time-to-failure $\mathrm{F}_1$ of $1.000$ was an artifact of a $0.4$-wide gap
+in the training label distribution straddling the decision threshold --- the
+classes were separable by construction --- which also starved conformal
+calibration in exactly the high-risk severity strata the guarantee exists to
+cover. Correcting the eleven defects and re-measuring gives $\mathrm{F}_1 =
+0.9672$, MAE $0.0313$ (from $0.0608$), and conformal coverage of $0.89$ against
+a nominal $0.90$, with per-stratum radii restored for the first time.
 
-I close the gap, correct eleven defects with a regression test for each, salvage
-and integrate the stranded work, and re-measure. Under the corrected
-distribution, $\mathrm{F}_1$ falls from $1.000$ to $0.9672$ and mean absolute
-error improves from $0.0608$ to $0.0313$ against a mean-predictor baseline of
-$0.2450$. Conformal coverage lands at $0.89$ against a nominal $0.90$ with mean
-interval width falling from $0.190$ to $0.119$, and all three severity strata
-receive their own radius for the first time, ordered $0.048 < 0.074 < 0.105$
-from normal to critical.
-
-I then run the detector against recorded machine audio --- the DCASE 2020 Task 2
-pump set, four units, unsupervised, on the official split --- and the synthetic
-result does not transfer. A later pass, made by actually executing the harness
-end-to-end with dependencies installed rather than reading it, finds the
-benchmark itself was measuring the wrong system: its feature extractor
-reimplemented the mel transform with \texttt{log1p} compression instead of
-importing the one production computes (dB via \texttt{AmplitudeToDB}), on the
-mistaken belief that importing it required a live message broker. It does not.
-Correcting that --- the same class of defect as the label-distribution hole,
-a benchmark quietly measuring something other than the deployed system ---
-moves mean AUC from $0.7064$ to $0.6730$ against a published autoencoder
-baseline of $0.7289$, and mean pAUC at $p{=}0.1$ from $0.4061$ to $0.2632$
-against $0.5999$. The shortfall is concentrated in precisely the low-false-alarm
-regime a plant would operate in. Per-unit AUC ranges from $0.5729$ to $0.7690$,
-so a single-unit evaluation would have supported almost any conclusion. That is
-the number I would quote, and it says a system scoring $0.9672$ on its own
-simulator falls short of a standard baseline on real audio once the harness
-measures what is actually deployed.
+On the DCASE 2020 Task 2 pump set --- real recordings, unsupervised, official
+split --- the synthetic result does not transfer: mean AUC $0.6730$ against a
+published baseline of $0.7289$, mean pAUC $0.2632$ against $0.5999$,
+concentrated in exactly the low-false-alarm regime a plant would operate in.
+That number itself moved once more on a later pass: executing the benchmark
+harness end-to-end, rather than reading it, found its feature extractor was
+scoring a transform the deployed system does not compute. I regard obtaining a
+real number, including one that falls short, as the more valuable outcome of
+this work than the number itself.
 \end{abstract}
 
 \tableofcontents
