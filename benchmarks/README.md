@@ -28,19 +28,31 @@ Current result with **no trained autoencoder** (frame-energy fallback), 4 nodes
 
 | Metric | Value |
 | :-- | --: |
-| ROC AUC | 0.9344 |
-| pAUC @ 10% FPR | 0.8369 |
-| Average precision | 0.9249 |
-| Precision / Recall | 0.9959 / 0.7571 |
-| False alarms per hour | 10.5 |
-| Events detected | 4 / 4 |
-| Mean lead time | 29.6 s |
-| Mean detection delay | 10.5 s |
+| ROC AUC | 0.8463 |
+| pAUC @ 10% FPR | 0.6205 |
+| Average precision | 0.8158 |
+| Precision / Recall | 1.0000 / 0.5426 |
+| False alarms per hour | 0.0 |
+| Events detected | 2 / 4 |
+| Mean lead time | 42.5 s |
+| Mean detection delay | 4.0 s |
 
 Reproduce with `python -m benchmarks.evaluate_synthetic --frames 300`. The run is
 deterministic at a fixed seed, so these are exact rather than approximate. Note the
 default is `--frames 400`, which scores a longer run and reports different figures;
 the table above is the 300-frame invocation.
+
+These numbers moved when the simulator's fault signatures became physically
+motivated (see the top-level README's "Simulator Realism" section): bearing
+squeal is now an amplitude-modulated impact train rather than a continuous
+tone, so its *average* energy per frame is lower even though peak energy is
+higher — and the frame-energy fallback scorer used here (no trained weights)
+only sees the average. That is a harder, more honest synthetic benchmark, not
+a regression: a naive energy detector missing a duty-cycled impact train is
+closer to how a real bearing fault actually behaves than the old continuous
+tone was. A trained `SpectrogramAutoencoder` (`--weights`) is expected to
+recover most of this gap, since reconstruction error responds to spectral
+shape, not just average magnitude.
 
 > These are synthetic faults whose spectral signatures were written by hand in
 > `mock_edge_device.py`. Strong numbers here show the pipeline works. They are

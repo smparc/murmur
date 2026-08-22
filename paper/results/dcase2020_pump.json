@@ -3,9 +3,9 @@
   "root": "C:\\Users\\smpar\\AppData\\Local\\murmur-data\\dcase",
   "per_group": {
     "pump/id_00": {
-      "auc": 0.8116083916083916,
-      "pauc_10": 0.6370629370629372,
-      "average_precision": 0.8996194128155011,
+      "auc": 0.7324475524475524,
+      "pauc_10": 0.3482517482517482,
+      "average_precision": 0.8230169019763964,
       "train_samples": 906,
       "test_samples": 243,
       "anomaly_rate": 0.588477366255144,
@@ -13,12 +13,12 @@
       "baseline_auc": 0.7289,
       "baseline_pauc": 0.5999,
       "baseline_system": "DCASE 2020 Task 2 baseline (autoencoder)",
-      "auc_vs_baseline": 0.08270839160839161
+      "auc_vs_baseline": 0.003547552447552449
     },
     "pump/id_02": {
-      "auc": 0.6947747747747748,
-      "pauc_10": 0.3810810810810811,
-      "average_precision": 0.7772521092952384,
+      "auc": 0.6174774774774775,
+      "pauc_10": 0.28648648648648645,
+      "average_precision": 0.713833253679204,
       "train_samples": 905,
       "test_samples": 211,
       "anomaly_rate": 0.5260663507109005,
@@ -26,12 +26,12 @@
       "baseline_auc": 0.7289,
       "baseline_pauc": 0.5999,
       "baseline_system": "DCASE 2020 Task 2 baseline (autoencoder)",
-      "auc_vs_baseline": -0.03412522522522521
+      "auc_vs_baseline": -0.1114225225225225
     },
     "pump/id_04": {
-      "auc": 0.6787,
-      "pauc_10": 0.262,
-      "average_precision": 0.7153478589287152,
+      "auc": 0.769,
+      "pauc_10": 0.32199999999999995,
+      "average_precision": 0.783019229679289,
       "train_samples": 602,
       "test_samples": 200,
       "anomaly_rate": 0.5,
@@ -39,12 +39,12 @@
       "baseline_auc": 0.7289,
       "baseline_pauc": 0.5999,
       "baseline_system": "DCASE 2020 Task 2 baseline (autoencoder)",
-      "auc_vs_baseline": -0.05020000000000002
+      "auc_vs_baseline": 0.040100000000000025
     },
     "pump/id_06": {
-      "auc": 0.6403921568627451,
-      "pauc_10": 0.3441176470588235,
-      "average_precision": 0.7257288034765317,
+      "auc": 0.5729411764705883,
+      "pauc_10": 0.09607843137254904,
+      "average_precision": 0.5816984178584178,
       "train_samples": 936,
       "test_samples": 202,
       "anomaly_rate": 0.504950495049505,
@@ -52,13 +52,13 @@
       "baseline_auc": 0.7289,
       "baseline_pauc": 0.5999,
       "baseline_system": "DCASE 2020 Task 2 baseline (autoencoder)",
-      "auc_vs_baseline": -0.0885078431372549
+      "auc_vs_baseline": -0.1559588235294117
     }
   },
-  "mean_auc": 0.7063688308114779,
-  "mean_pauc_10": 0.4060654163007104,
+  "mean_auc": 0.6729665515989045,
+  "mean_pauc_10": 0.2632041665276959,
   "groups_scored": 4,
   "epochs": 20,
   "seed": 1337,
-  "elapsed_s": 87.9
+  "elapsed_s": 129.5
 }

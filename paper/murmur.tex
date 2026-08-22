@@ -19,6 +19,10 @@
   belowskip=10pt,
 }
 
+% Every top-level section starts on a fresh page.
+\let\oldsection\section
+\renewcommand{\section}{\clearpage\oldsection}
+
 \title{\textbf{murmur: Spatio-Temporal Acoustic Monitoring for Predictive
 Maintenance}}
 \author{Matthew Park}
@@ -30,58 +34,42 @@ Maintenance}}
 \begin{abstract}
 \noindent
 Industrial acoustic monitoring promises to detect mechanical failure before it
-occurs, from sound alone. Murmur is a system built for that task: an array of
-microphones feeds a spatio-temporal graph neural network over an
-inverse-distance acoustic topology, whose per-timestep embeddings drive a
-continuous-time liquid network that forecasts time-to-failure, with a
-convolutional autoencoder scoring per-node anomalies against each microphone's
-own rolling baseline.
+occurs, from sound alone. Murmur is a system built for that task: microphones
+feed a spatio-temporal graph neural network over an acoustic topology, whose
+embeddings drive a continuous-time liquid network forecasting time-to-failure,
+with a convolutional autoencoder scoring per-node anomalies against each
+microphone's own rolling baseline.
 
-This paper reports an audit of that codebase and a substantially corrected
-system. The codebase is unusual in one respect that turns out to matter: it was
-built by three independent coding agents working concurrently in the same
-repository. That produced a specific and reproducible failure pattern. Two
-agents implemented acoustic localisation twice and an evaluation harness twice;
-one of each survived. Six commits of finished work --- source localisation,
-public-dataset benchmarking, anomaly explainability, and a fault taxonomy ---
-were stranded on an unmerged branch, and two further modules, webhook alerting
-and ONNX export, existed only as untracked files inside an agent worktree and
-would have been destroyed by a routine cleanup. An audit performed by one agent
-correctly identified eleven defects and, having been placed in a read-only role,
-fixed none of them; all eleven were still live.
+This paper audits that codebase, built by three independent coding agents
+working concurrently, and reports a substantially corrected system.
+Concurrency produced a specific failure pattern: acoustic localisation and an
+evaluation harness were each implemented twice; six commits of finished work
+were stranded on an unmerged branch, and two further modules existed only as
+untracked files a routine worktree cleanup would have destroyed. A prior
+read-only audit correctly identified eleven defects and fixed none of them.
 
-The most consequential finding is not a crash. The system reported a
-time-to-failure $\mathrm{F}_1$ of $1.000$. That figure was an artifact of the
-data generator: fault severity was drawn from $U(0.5, 1.0)$ while healthy
-sequences sat below $0.1$, leaving a $0.4$-wide interval containing no examples,
-with the $0.5$ decision threshold sitting inside it. The classes were separable
-by construction. The same draw confined the middle severity band to a sliver,
-starving the per-group conformal calibration that exists specifically to hold
-coverage in the high-risk strata --- so the one guarantee aimed at the regime an
-operator acts in was the one silently disabled.
+The most consequential finding was not a crash but a measurement. A reported
+time-to-failure $\mathrm{F}_1$ of $1.000$ was an artifact of a $0.4$-wide gap
+in the training label distribution straddling the decision threshold --- the
+classes were separable by construction --- which also starved conformal
+calibration in exactly the high-risk severity strata the guarantee exists to
+cover. Correcting the eleven defects and re-measuring gives $\mathrm{F}_1 =
+0.9672$, MAE $0.0313$ (from $0.0608$), and conformal coverage of $0.89$ against
+a nominal $0.90$, with per-stratum radii restored for the first time.
 
-I close the gap, correct eleven defects with a regression test for each, salvage
-and integrate the stranded work, and re-measure. Under the corrected
-distribution, $\mathrm{F}_1$ falls from $1.000$ to $0.9672$ and mean absolute
-error improves from $0.0608$ to $0.0313$ against a mean-predictor baseline of
-$0.2450$. Conformal coverage lands at $0.89$ against a nominal $0.90$ with mean
-interval width falling from $0.190$ to $0.119$, and all three severity strata
-receive their own radius for the first time, ordered $0.048 < 0.074 < 0.105$
-from normal to critical.
-
-I then run the detector against recorded machine audio --- the DCASE 2020 Task 2
-pump set, four units, unsupervised, on the official split --- and the synthetic
-result does not transfer. Mean AUC is $0.7064$ against a published autoencoder
-baseline of $0.7289$, and mean pAUC at $p{=}0.1$ is $0.4061$ against $0.5999$.
-The shortfall is concentrated in precisely the low-false-alarm regime a plant
-would operate in. Per-unit AUC ranges from $0.6404$ to $0.8116$, so a
-single-unit evaluation would have supported almost any conclusion. That is the
-number I would quote, and it says a system scoring $0.9672$ on its own simulator
-is at best comparable to a standard baseline on real audio.
+On the DCASE 2020 Task 2 pump set --- real recordings, unsupervised, official
+split --- the synthetic result does not transfer: mean AUC $0.6730$ against a
+published baseline of $0.7289$, mean pAUC $0.2632$ against $0.5999$,
+concentrated in exactly the low-false-alarm regime a plant would operate in.
+That number itself moved once more on a later pass: executing the benchmark
+harness end-to-end, rather than reading it, found its feature extractor was
+scoring a transform the deployed system does not compute. I regard obtaining a
+real number, including one that falls short, as the more valuable outcome of
+this work than the number itself.
 \end{abstract}
 
+\clearpage
 \tableofcontents
-\newpage
 
 \section{Introduction}
 
@@ -638,31 +626,56 @@ is also built from and therefore the only one that can be compared.
 \toprule
 Unit & AUC & pAUC@10\% & AP & Baseline AUC \\
 \midrule
-pump/id\_00 & 0.8116 & 0.6371 & 0.8996 & 0.7289 \\
-pump/id\_02 & 0.6948 & 0.3811 & 0.7773 & 0.7289 \\
-pump/id\_04 & 0.6787 & 0.2620 & 0.7153 & 0.7289 \\
-pump/id\_06 & 0.6404 & 0.3441 & 0.7257 & 0.7289 \\
+pump/id\_00 & 0.7324 & 0.3483 & 0.8230 & 0.7289 \\
+pump/id\_02 & 0.6175 & 0.2865 & 0.7138 & 0.7289 \\
+pump/id\_04 & 0.7690 & 0.3220 & 0.7830 & 0.7289 \\
+pump/id\_06 & 0.5729 & 0.0961 & 0.5817 & 0.7289 \\
 \midrule
-\textbf{Mean} & \textbf{0.7064} & \textbf{0.4061} & 0.7795 & 0.7289 \\
+\textbf{Mean} & \textbf{0.6730} & \textbf{0.2632} & 0.7254 & 0.7289 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Mean AUC of $0.7064$ sits $0.0225$ below the published DCASE 2020 autoencoder
-baseline of $0.7289$. Mean pAUC at $p{=}0.1$ is $0.4061$ against a baseline of
-$0.5999$, a shortfall of $0.194$ --- and pAUC is the metric that matters
+Mean AUC of $0.6730$ sits $0.0559$ below the published DCASE 2020 autoencoder
+baseline of $0.7289$. Mean pAUC at $p{=}0.1$ is $0.2632$ against a baseline of
+$0.5999$, a shortfall of $0.337$ --- and pAUC is the metric that matters
 operationally, because it integrates only over the low-false-positive region
 where a plant would actually set its threshold. A system that fires on ten
 percent of healthy pumps has already been muted by its operators.
 
-Two things deserve emphasis. First, per-unit AUC spans $0.6404$ to $0.8116$;
-reporting id\_00 alone would have suggested the system beats the baseline by
-eight points, and reporting id\_06 alone that it loses by nine. Second, and more
-importantly, the same detector scores $\mathrm{F}_1 = 0.9672$ on the corrected
-simulator. The simulator was made harder in Section~\ref{sec:data} and remains
-far easier than a real pump. A generator is a statement of its author's
-assumptions, and this is the measurement of how much those assumptions were
-worth.
+\subsubsection{A benchmark defect found only by executing it}
+
+These are not the numbers this benchmark first produced. The harness's feature
+extractor (\texttt{benchmarks/features.py}) reimplemented the mel transform
+with \texttt{log1p} compression rather than importing the one
+\texttt{src/ingestion} actually computes --- \texttt{AmplitudeToDB} at
+$\text{top\_db}{=}80$ --- on the documented but false belief that importing the
+production module opens a Kafka connection at import time. It does not; nothing
+in it runs at import beyond an ordinary class definition, and a sibling module
+(\texttt{src/evaluation/mimii.py}) already imported it directly without issue.
+\texttt{log1p} and \texttt{AmplitudeToDB} compress dynamic range differently
+enough to change an autoencoder's reconstruction-error scale and its
+sensitivity to quiet spectral detail, so every number this benchmark had ever
+produced, including an earlier revision of the table above, was measured
+against a feature representation the deployed system does not compute. This is
+the identical failure mode as the label-distribution hole in
+Section~\ref{sec:data}: a measurement that is internally consistent and
+completely disconnected from the system it claims to describe. It was found
+not by inspection --- the incorrect docstring had stood unchallenged --- but by
+actually installing the dependencies, running the harness against the real
+corpus, and noticing that a benchmark import path already proven safe
+elsewhere in the same tree was being avoided for a reason that did not hold.
+Correcting the extractor to import the production transform, matching
+\texttt{mimii.py}'s existing practice, produced the table above.
+
+Two things deserve emphasis. First, per-unit AUC spans $0.5729$ to $0.7690$;
+reporting id\_04 alone would have suggested the system beats the baseline by
+four points, and reporting id\_06 alone that it loses by sixteen. Second, and
+more importantly, the same detector scores $\mathrm{F}_1 = 0.9672$ on the
+corrected simulator. The simulator was made harder in Section~\ref{sec:data}
+and remains far easier than a real pump. A generator is a statement of its
+author's assumptions, and this is the measurement of how much those
+assumptions were worth.
 
 The comparison carries two caveats. The baseline figures are transcribed from
 the DCASE 2020 results and should be verified against the official page before
@@ -768,15 +781,18 @@ first time --- revealing that intervals on critical forecasts had been
 approximately twice too narrow, concealed behind an apparently healthy marginal
 coverage figure.
 
-On recorded pump audio the corrected detector reaches a mean AUC of $0.7064$
-against a published baseline of $0.7289$, and a mean pAUC of $0.4061$ against
+On recorded pump audio the corrected detector reaches a mean AUC of $0.6730$
+against a published baseline of $0.7289$, and a mean pAUC of $0.2632$ against
 $0.5999$. It does not beat a standard autoencoder baseline, and it is furthest
 behind in the low-false-alarm regime that determines whether an alerting system
 survives contact with the people it pages. I regard obtaining that number as the
 more valuable outcome than the number itself: the gap between $0.9672$ on the
-simulator and $0.71$ on real audio is the quantity the earlier reported
+simulator and $0.67$ on real audio is the quantity the earlier reported
 $\mathrm{F}_1 = 1.000$ was concealing, and it is now measured rather than
-assumed.
+assumed --- and even that $0.67$ was, until it was actually executed rather
+than read, a measurement of a benchmark's own \texttt{log1p} substitute for the
+production feature transform, not of the system in
+Section~\ref{sec:dcase}.
 
 What this work provides is a pipeline whose claims can be checked: the
 measurement protocol is corrected, the uncertainty quantification does what it
@@ -788,7 +804,7 @@ are untested on real data, because DCASE is single-channel and no public corpus
 provides a synchronised industrial microphone array; producing one, or
 evaluating on MIMII's multi-channel recordings, would exercise the parts of the
 architecture the pump result leaves entirely unmeasured. And the pAUC shortfall
-is the concrete target: a detector at $0.41$ where the baseline reaches $0.60$
+is the concrete target: a detector at $0.26$ where the baseline reaches $0.60$
 has a specific, measurable deficiency in the only operating region that
 matters.
 

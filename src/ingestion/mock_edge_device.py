@@ -3,10 +3,14 @@ Mock edge device that simulates real-time factory microphone streams.
 
 
 Generates synthetic audio chunks with realistic degradation patterns:
-    - Stochastic anomaly injection (not deterministic every 20 loops)
-    - Progressive degradation (gradual onset, not binary)
+    - Poisson-process anomaly injection (a mean-time-between-failure, not a
+      flat per-tick coin flip that fires every few seconds)
+    - Progressive degradation (gradual onset, not binary; gradual decay on
+      recovery, not an instant reset)
     - No data leakage (is_anomalous_flag removed from payloads)
-    - Multiple fault signatures (bearing, cavitation, imbalance)
+    - Multiple fault signatures, each tied to a plausible physical mechanism
+      (bearing defect frequency, rotor imbalance at running speed, cavitation
+      broadband spectrum) rather than an arbitrary hand-picked tone
 """
 
 import logging
@@ -21,6 +25,14 @@ from src.settings import settings
 
 log = logging.getLogger(__name__)
 
+# Nominal shaft rotation rate for the simulated motors: a 4-pole induction
+# motor at 60 Hz mains turns near 1800 rpm, and slip under load settles a
+# little below that — 1770 rpm is a textbook running speed. Fault signatures
+# below are expressed relative to this rather than to arbitrary constants, so
+# the bearing defect frequency and the imbalance modulation frequency sit in
+# the same physically-consistent ratio a real spectrum analyzer would show.
+_SHAFT_HZ = 1770.0 / 60.0  # ~29.5 Hz
+
 
 class FaultType(Enum):
     NONE = "none"
@@ -33,6 +45,70 @@ def _delivery_report(err, msg):
     """Callback triggered on successful/failed message delivery."""
     if err is not None:
         log.error("Message delivery failed: %s", err)
+
+
+def _pink_noise(n: int) -> np.ndarray:
+    """
+    Unit-variance 1/f-shaped noise of length ``n``.
+
+    Real machine-room ambient noise is not flat white noise: energy is
+    concentrated at low frequencies and decays with a long tail, which is why
+    a factory floor sounds like a low rumble rather than static. Shaping a
+    white-noise draw by 1/sqrt(f) in the frequency domain reproduces that
+    without pulling in a filter-design dependency.
+
+    Draws from the legacy ``np.random`` global state (not a local
+    ``Generator``) so callers that seed ``np.random.seed(...)`` for
+    reproducibility — see ``benchmarks/scenario.py`` — still get a
+    deterministic result.
+    """
+    white = np.random.normal(0.0, 1.0, n)
+    spectrum = np.fft.rfft(white)
+    freqs = np.fft.rfftfreq(n)
+    freqs[0] = freqs[1] if n > 1 else 1.0  # avoid a divide-by-zero at DC
+    spectrum = spectrum / np.sqrt(freqs)
+    pink = np.fft.irfft(spectrum, n)
+    std = pink.std()
+    return pink / std if std > 1e-12 else pink
+
+
+def poisson_tick_probability(dt: float, mtbf: float) -> float:
+    """
+    Per-tick probability of a memoryless (Poisson) arrival with mean ``mtbf``.
+
+    A flat per-tick constant is not equivalent to a target MTBF: halving the
+    chunk duration would silently halve the real-world fault rate too, unless
+    the per-tick probability is derived from ``dt`` rather than picked once
+    and left alone. ``1 - exp(-dt/mtbf)`` is the exact per-tick probability for
+    a Poisson process observed in discrete steps of size ``dt``, so the
+    long-run arrival rate stays ``1/mtbf`` regardless of chunk size.
+    """
+    if dt <= 0:
+        raise ValueError(f"dt must be > 0, got {dt}")
+    if mtbf <= 0:
+        raise ValueError(f"mtbf must be > 0, got {mtbf}")
+    return 1.0 - np.exp(-dt / mtbf)
+
+
+def _ambient_floor(t: np.ndarray, node_id: int) -> np.ndarray:
+    """
+    Structured factory ambient: mains hum plus shaped broadband noise.
+
+    A single 60 Hz tone over white noise is spectrally unlike anything a
+    microphone actually records near industrial equipment. Real floors carry
+    the mains fundamental *and* its odd harmonics (motor slot noise,
+    transformer buzz), on top of a 1/f-shaped broadband bed rather than a flat
+    one. The per-node phase offset avoids every "microphone" emitting the
+    identical waveform, which no two real sensors would.
+    """
+    phase = node_id * 0.7
+    mains = (
+        0.5 * np.sin(2 * np.pi * 60 * t + phase)
+        + 0.15 * np.sin(2 * np.pi * 180 * t + phase)
+        + 0.05 * np.sin(2 * np.pi * 300 * t + phase)
+    )
+    broadband = 0.1 * _pink_noise(t.size)
+    return mains + broadband
 
 
 def generate_mock_audio(
@@ -54,27 +130,39 @@ def generate_mock_audio(
     """
     t = np.linspace(0, settings.CHUNK_DURATION, settings.SAMPLES_PER_CHUNK, endpoint=False)
 
-    # Base factory ambient noise (low-frequency rumble + white noise)
-    base_noise = 0.5 * np.sin(2 * np.pi * 60 * t) + np.random.normal(
-        0, 0.1, settings.SAMPLES_PER_CHUNK
-    )
+    base_noise = _ambient_floor(t, node_id)
 
     if fault == FaultType.BEARING and severity > 0:
-        # High-frequency bearing squeal (2-4 kHz with harmonics)
-        freq = 2000 + node_id * 200
-        squeal = severity * 0.8 * np.sin(2 * np.pi * freq * t)
-        # Add harmonic
-        squeal += severity * 0.3 * np.sin(2 * np.pi * freq * 2 * t)
-        base_noise += squeal
+        # A bearing defect does not ring continuously; it produces an impact
+        # each time a rolling element crosses the defect, which excites a
+        # high-frequency structural resonance that decays until the next
+        # impact. The impact repetition rate — the "ball-pass frequency,
+        # outer race" — is set by shaft speed and bearing geometry; ~3.5x
+        # shaft speed is typical for a common deep-groove ball bearing, with
+        # a little per-unit spread for bearing size/geometry.
+        bpfo = 3.5 * _SHAFT_HZ + node_id * 0.4
+        resonance = 2000 + node_id * 200
+
+        # Sharpened half-sine lobes approximate the impact/ring-down train;
+        # `pulse` is a periodic envelope, not a continuous carrier.
+        pulse = np.clip(np.sin(2 * np.pi * bpfo * t), 0.0, None) ** 6
+        pulse /= pulse.max() + 1e-12
+
+        carrier = np.sin(2 * np.pi * resonance * t) + 0.4 * np.sin(2 * np.pi * resonance * 2 * t)
+        base_noise += severity * 3.0 * pulse * carrier
 
     elif fault == FaultType.CAVITATION and severity > 0:
-        # Broadband noise burst (pump cavitation). This term was previously
-        # computed and then discarded, so the simulated cavitation signature
-        # consisted of impulses alone and was missing its defining
-        # characteristic — the broadband hiss of collapsing vapour bubbles.
-        base_noise += severity * np.random.normal(0, 0.5, settings.SAMPLES_PER_CHUNK)
+        # Cavitation is genuinely broadband — collapsing vapour bubbles excite
+        # no particular resonance — but it is not flat either; energy skews
+        # toward the mid/high band. Differencing pink noise is a cheap
+        # highpass that produces that tilt without a filter-design dependency.
+        shaped = np.diff(_pink_noise(t.size), prepend=0.0)
+        shaped_std = shaped.std()
+        if shaped_std > 1e-12:
+            shaped /= shaped_std
+        base_noise += severity * 0.5 * shaped
 
-        # Transient impulses on top of the broadband component.
+        # Individual bubble-collapse impacts on top of the broadband hiss.
         n_impulses = max(1, int(severity * 5))
         for _ in range(n_impulses):
             pos = np.random.randint(0, settings.SAMPLES_PER_CHUNK)
@@ -82,10 +170,15 @@ def generate_mock_audio(
             base_noise[pos : pos + width] += severity * 1.5
 
     elif fault == FaultType.IMBALANCE and severity > 0:
-        # Low-frequency amplitude modulation (rotating imbalance)
-        mod_freq = 15 + node_id * 3
+        # The textbook rotating-imbalance signature is amplitude modulation at
+        # 1x running speed — one heavy spot passing through its arc per
+        # revolution — not an arbitrary low frequency. A real imbalance also
+        # raises the 1x vibration tone directly, not only the modulation
+        # depth of everything else, so a modest direct component rides
+        # alongside the multiplicative envelope.
+        mod_freq = _SHAFT_HZ + node_id * 0.3
         modulation = 1.0 + severity * 0.6 * np.sin(2 * np.pi * mod_freq * t)
-        base_noise *= modulation
+        base_noise = base_noise * modulation + severity * 0.25 * np.sin(2 * np.pi * mod_freq * t)
 
     return base_noise.astype(np.float32).tobytes()
 
@@ -111,7 +204,15 @@ def run_edge_simulation(max_loops: int | None = None) -> int:
     # Stochastic degradation state per node
     node_degradation = dict.fromkeys(range(num_nodes), 0.0)
     node_fault_type = dict.fromkeys(range(num_nodes), FaultType.NONE)
-    anomaly_probability = 0.03  # 3% chance per frame of starting degradation
+
+    # Per-tick hazard of a *new* fault starting on an otherwise-healthy node,
+    # derived from a mean-time-between-failure rather than picked to look
+    # good on a demo. The previous flat 3%-per-tick constant implied an MTBF
+    # of ~17 seconds, which starts a new episode on some node every few
+    # seconds and reads as simulator noise rather than plant behaviour.
+    anomaly_probability = poisson_tick_probability(
+        settings.CHUNK_DURATION, settings.SIM_FAULT_MTBF_S
+    )
 
     try:
         while max_loops is None or loop_count < max_loops:
@@ -133,10 +234,20 @@ def run_edge_simulation(max_loops: int | None = None) -> int:
                         1.0, node_degradation[node] + np.random.uniform(0.01, 0.05)
                     )
 
-                    # Chance of self-recovery (minor issue resolves)
-                    if node_degradation[node] < 0.3 and np.random.random() < 0.1:
-                        node_degradation[node] = 0.0
-                        node_fault_type[node] = FaultType.NONE
+                    # Chance of self-recovery for a still-mild issue. Real
+                    # early-stage faults that resolve (a loose fitting
+                    # re-seats, a transient load clears) fade out over several
+                    # ticks; snapping straight to zero looks like a sensor
+                    # dropout, not a mechanical condition clearing.
+                    if (
+                        node_degradation[node] < 0.3
+                        and np.random.random() < settings.SIM_RECOVERY_PROBABILITY
+                    ):
+                        node_degradation[node] = max(
+                            0.0, node_degradation[node] - np.random.uniform(0.05, 0.15)
+                        )
+                        if node_degradation[node] == 0.0:
+                            node_fault_type[node] = FaultType.NONE
 
                 audio_bytes = generate_mock_audio(
                     node, fault=node_fault_type[node], severity=node_degradation[node]

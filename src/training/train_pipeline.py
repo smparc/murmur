@@ -203,21 +203,58 @@ def generate_normal_spectrograms(
     """
     Healthy-machine spectrogram patches for autoencoder pre-training.
 
-    Structured rather than white: a low-frequency rumble plus harmonics, so the
-    autoencoder learns an actual manifold to depart from.
+    Built by running the edge simulator's own healthy audio
+    (``mock_edge_device.generate_mock_audio``) through the production mel
+    transform, rather than hand-crafting values directly in spectrogram
+    space. The previous version drew independent Gaussian blobs in a range
+    of roughly ``[-0.2, 1.2]`` with mean ``~0.2`` — nothing to do with what
+    the production transform actually outputs for real simulator audio,
+    which runs mean ``~13`` over a range of roughly ``[3, 43]`` in dB. The
+    autoencoder was training on one distribution and would be scored, both
+    in ``benchmarks.evaluate_synthetic`` and in production, on a
+    non-overlapping one: measured end-to-end, a trained autoencoder scored
+    within noise of the untrained frame-energy fallback (ROC AUC 0.8456 vs
+    0.8463) on the synthetic regression benchmark, i.e. training bought
+    nothing. Routing through the real waveform generator and the real
+    transform closes that gap by construction rather than by degree.
     """
-    rng = np.random.default_rng(seed)
-    bins = np.arange(n_mels)[:, None]
-    frames = np.arange(n_frames)[None, :]
+    if n_mels != settings.N_MELS or n_frames != settings.MEL_FRAMES_PER_CHUNK:
+        raise ValueError(
+            f"generate_normal_spectrograms produces spectrograms shaped by the "
+            f"production audio pipeline: n_mels must be {settings.N_MELS} "
+            f"(got {n_mels}) and n_frames must be {settings.MEL_FRAMES_PER_CHUNK} "
+            f"(got {n_frames})."
+        )
 
-    out = np.empty((num_samples, 1, n_mels, n_frames), dtype=np.float32)
-    for i in range(num_samples):
-        rumble = np.exp(-0.5 * ((bins - rng.uniform(2, 8)) / 4.0) ** 2)
-        harmonic = 0.4 * np.exp(-0.5 * ((bins - rng.uniform(18, 26)) / 3.0) ** 2)
-        drift = 1.0 + 0.1 * np.sin(2 * np.pi * rng.uniform(0.02, 0.08) * frames)
-        base = (rumble + harmonic) * drift
-        out[i, 0] = (base + rng.normal(0, 0.05, size=(n_mels, n_frames))).astype(np.float32)
-    return torch.from_numpy(out)
+    from src.ingestion.cuda_stream_processor import get_mel_spectrogram_transform
+    from src.ingestion.mock_edge_device import FaultType, generate_mock_audio
+
+    rng = np.random.default_rng(seed)
+    if seed is not None:
+        # generate_mock_audio draws from the legacy np.random global state
+        # (see its own docstring), not a local Generator, so reproducing a
+        # given seed here needs that state seeded too, not just `rng`.
+        np.random.seed(seed)
+
+    waveforms = np.stack(
+        [
+            np.frombuffer(
+                generate_mock_audio(
+                    node_id=int(rng.integers(0, settings.NUM_NODES)), fault=FaultType.NONE
+                ),
+                dtype=np.float32,
+            )
+            for _ in range(num_samples)
+        ]
+    )
+
+    transform = get_mel_spectrogram_transform()
+    with torch.no_grad():
+        # get_mel_spectrogram_transform lives on DEVICE (see
+        # src.ingestion.cuda_stream_processor); the input has to match.
+        spectrograms = transform(torch.from_numpy(waveforms).to(DEVICE))  # (N, n_mels, n_frames)
+
+    return spectrograms.unsqueeze(1).cpu()
 
 
 def train_val_test_split(

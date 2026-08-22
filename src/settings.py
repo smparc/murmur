@@ -184,6 +184,24 @@ class Settings:
     EARLY_STOP_PATIENCE: int = field(default_factory=lambda: _env_int("EARLY_STOP_PATIENCE", 10))
     SEED: int = field(default_factory=lambda: _env_int("SEED", 1337))
 
+    # -- Edge simulator --
+    # Mean seconds between new fault onsets on a single node, as a Poisson
+    # process. The previous constant was a flat 3%-per-tick coin flip, which at
+    # a 0.5s chunk cadence starts a new degradation episode on some node every
+    # ~17 seconds on average — a live demo that never stops flashing alarms
+    # and looks nothing like a factory floor, where a bearing going bad is a
+    # weeks-to-months event. Per-tick hazard is derived as
+    # ``1 - exp(-CHUNK_DURATION / SIM_FAULT_MTBF_S)`` so the arrival process
+    # stays memoryless regardless of chunk size.
+    SIM_FAULT_MTBF_S: float = field(default_factory=lambda: _env_float("SIM_FAULT_MTBF_S", 240.0))
+    # Chance per tick that a mild, still-early fault (severity < 0.3) begins to
+    # resolve. Kept low and, when it fires, the severity decays over several
+    # ticks rather than snapping to zero — an instant reset reads as a sensor
+    # glitch, not a mechanical issue actually clearing.
+    SIM_RECOVERY_PROBABILITY: float = field(
+        default_factory=lambda: _env_float("SIM_RECOVERY_PROBABILITY", 0.02)
+    )
+
     # -- Infrastructure --
     MODEL_DIR: str = field(default_factory=lambda: _env_str("MODEL_DIR", "models"))
     MLFLOW_TRACKING_URI: str = field(
@@ -320,6 +338,12 @@ class Settings:
 
         if self.CHUNK_DURATION <= 0:
             errors.append(f"CHUNK_DURATION must be > 0, got {self.CHUNK_DURATION}")
+        if self.SIM_FAULT_MTBF_S <= 0:
+            errors.append(f"SIM_FAULT_MTBF_S must be > 0, got {self.SIM_FAULT_MTBF_S}")
+        if not 0 <= self.SIM_RECOVERY_PROBABILITY <= 1:
+            errors.append(
+                f"SIM_RECOVERY_PROBABILITY must be in [0, 1], got {self.SIM_RECOVERY_PROBABILITY}"
+            )
         if self.LEARNING_RATE <= 0:
             errors.append(f"LEARNING_RATE must be > 0, got {self.LEARNING_RATE}")
         if not 0 <= self.LLM_TEMPERATURE <= 2:

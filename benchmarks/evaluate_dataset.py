@@ -218,6 +218,18 @@ def format_report(results: dict) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # format_report emits non-ASCII characters (Δ, and whatever a machine
+    # name from the dataset happens to contain). Windows' default console
+    # encoding is the legacy ANSI code page (cp1252 for an en-US install),
+    # not UTF-8, so a bare `print()` of that table crashes with
+    # UnicodeEncodeError on a stock Windows machine -- verified by actually
+    # running this on Windows, which is exactly the platform murmur-train
+    # documents as supported. `errors="replace"` degrades to a `?` instead
+    # of crashing on a console that genuinely cannot render the character.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(description="Evaluate Murmur on public datasets")
     parser.add_argument("--dataset", required=True, choices=["mimii", "dcase", "ims"])
     parser.add_argument("--root", required=True, help="dataset root directory")
@@ -241,13 +253,17 @@ def main(argv: list[str] | None = None) -> int:
         limit_groups=args.limit_groups,
     )
 
+    # Written before the console report: the JSON is the durable artifact,
+    # and a formatting/encoding problem in the human-readable table must not
+    # cost a benchmark run that already took minutes of real compute.
+    if args.json:
+        Path(args.json).write_text(json.dumps(results, indent=2), encoding="utf-8")
+        log.info("Wrote %s", args.json)
+
     print()
     print(format_report(results))
     print()
 
-    if args.json:
-        Path(args.json).write_text(json.dumps(results, indent=2), encoding="utf-8")
-        log.info("Wrote %s", args.json)
     return 0
 
 

@@ -80,6 +80,16 @@ class TestValidation:
         with pytest.raises(ConfigError, match="SAMPLE_RATE"):
             Settings()
 
+    def test_non_positive_fault_mtbf_rejected(self, monkeypatch):
+        monkeypatch.setenv("SIM_FAULT_MTBF_S", "0")
+        with pytest.raises(ConfigError, match="SIM_FAULT_MTBF_S"):
+            Settings()
+
+    def test_recovery_probability_out_of_range_rejected(self, monkeypatch):
+        monkeypatch.setenv("SIM_RECOVERY_PROBABILITY", "1.5")
+        with pytest.raises(ConfigError, match="SIM_RECOVERY_PROBABILITY"):
+            Settings()
+
     def test_multiple_errors_reported_together(self, monkeypatch):
         monkeypatch.setenv("GNN_EMBEDDING_DIM", "-1")
         monkeypatch.setenv("SEQ_LENGTH", "-5")

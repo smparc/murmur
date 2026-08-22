@@ -85,7 +85,7 @@ scored telemetry to the API.
 | **CI/CD** | GitHub Actions | Lint, format, tests on 3 Python versions, Kafka integration, frontend build, manifest validation, image publish. |
 | **Frontend** | React, Next.js, Recharts | Per-node forecast series, exponential-backoff reconnect, staleness indicators. |
 | **Benchmarking** | MIMII / ToyADMOS | Scores the production detector on recorded machine faults; AUC and pAUC per machine type. |
-| **Testing** | pytest | 459 tests across models, detection, localization, calibration, ingestion, worker, API, auth and configuration. |
+| **Testing** | pytest | 470 tests across models, detection, localization, calibration, ingestion, worker, API, auth and configuration — all pass on a real Python 3.12 / CPU-only install, verified end-to-end. |
 
 ---
 
@@ -120,7 +120,7 @@ murmur/
 │   ├── observability/metrics.py       # Prometheus metrics
 │   ├── training/train_pipeline.py     # Four-stage training + conformal calibration
 │   └── translation/llm_decoder.py     # FastAPI + WebSocket telemetry service
-└── tests/                             # 459 unit + integration tests
+└── tests/                             # 470 unit + integration tests
 ```
 
 ---
@@ -215,6 +215,8 @@ All settings are environment variables, validated at import. See
 | `ALERT_WEBHOOK_URL` | *(empty)* | Generic JSON webhook for alerts |
 | `ALERT_COOLDOWN_SECONDS` | `900` | Silence per node and fault after a page; escalation bypasses it |
 | `ALERT_MIN_SEVERITY` | `warning` | Lowest severity that pages |
+| `SIM_FAULT_MTBF_S` | `240.0` | Mean seconds between new fault onsets per node in `murmur-simulate`, as a Poisson process |
+| `SIM_RECOVERY_PROBABILITY` | `0.02` | Chance per tick that a still-mild simulated fault begins to fade out |
 | `TDOA_ENABLED` | `true` | Enable GCC-PHAT source localization |
 | `TDOA_MIN_COHERENCE` | `0.15` | Minimum correlation for a pair to inform the position solve |
 | `TDOA_STALENESS_TOLERANCE` | `0.5` | Max array clock spread (s) treated as one acoustic instant |
@@ -334,6 +336,27 @@ python -m src.evaluation.mimii /path/to/mimii --aggregate mean --json report.jso
 - Breaks results down **per machine**. MIMII difficulty varies enormously by type — valves are near-impossible for reconstruction-based detectors because normal operation is itself impulsive — and a single pooled AUC hides that entirely.
 
 The corpus is optional: the harness is exercised end-to-end in CI against a synthetic corpus in the same layout, so no 26 GB download is needed to run the tests.
+
+`benchmarks/evaluate_dataset.py` (the DCASE/MIMII/IMS harness behind `paper/results/`) did not follow this rule until recently: its feature extractor reimplemented the mel transform with `log1p` compression instead of importing the production one, on the mistaken belief that the production module opens a Kafka connection at import time. It does not — `src/evaluation/mimii.py` already imports it directly — so `benchmarks/features.py` now does the same. `log1p` and production's `AmplitudeToDB(top_db=80)` compress dynamic range differently enough to change an autoencoder's reconstruction-error scale and its sensitivity to quiet detail, and it made a real difference: rerun against the DCASE2020 pump set (4 units, 20 epochs, seed 1337, official split) the corrected pipeline scores **mean AUC 0.6730 / mean pAUC@10% 0.2632**, down from the previously-reported 0.7064 / 0.4061 — because the earlier number was measuring a feature representation production does not compute, not the deployed system. `paper/results/dcase2020_pump.json` and `paper/murmur.tex` are updated to this measured result.
+
+### Simulator Realism
+
+`src/ingestion/mock_edge_device.py` (`murmur-simulate`) drives the live dashboard demo, and is deliberately kept separate from anything a benchmark number depends on — but it used to be a poor stand-in for a factory even as a demo. Two things were wrong:
+
+- **Fault arrival was a flat 3%-per-tick coin flip.** At a 0.5 s chunk cadence that starts a new degradation episode on some node roughly every 17 seconds, with a 10% chance per tick to snap a mild fault straight back to healthy — a dashboard that never stops flashing alarms and looks nothing like a plant, where a bearing going bad is a weeks-to-months event. Fault onset is now a Poisson process with a configurable mean time between failures (`SIM_FAULT_MTBF_S`, default 240s per node), and recovery — `SIM_RECOVERY_PROBABILITY` — fades a mild fault out over several ticks instead of resetting it instantly.
+- **The signatures themselves were arbitrary tones over white noise.** Bearing squeal is now an amplitude-modulated impact/ring-down train at a ball-pass-frequency-outer, tied to a nominal shaft speed, rather than a continuous sine; rotor imbalance modulates at 1x running speed instead of an unrelated constant; cavitation shapes broadband noise toward the mid/high band instead of flat white noise; and the ambient floor is 1/f (pink) noise plus mains hum and its odd harmonics instead of a single 60 Hz tone over Gaussian noise.
+
+None of this touches detection accuracy — `benchmarks/scenario.py` still drives `generate_mock_audio` on a fixed, labelled schedule for the synthetic regression gate, and nothing about real-data benchmarking depends on the live simulator. It only affects what the live demo sounds and looks like.
+
+### Findings From Actually Running the Pipeline
+
+Two more defects surfaced once the dependencies were actually installed and the pipeline actually executed on a real machine, rather than read:
+
+- **The production autoencoder was pretrained on the wrong distribution.** `src/training/train_pipeline.py`'s `generate_normal_spectrograms` — stage 1 of `murmur-train` — built "healthy" spectrograms by hand-drawing Gaussian blobs directly in spectrogram space, in a range (mean ≈ 0.2, roughly `[-0.2, 1.2]`) that shares almost no overlap with what the production mel transform actually outputs for real simulator audio (mean ≈ 13, roughly `[3, 43]` in dB — verified by running both through the same transform and comparing). The gap predates this session's dB-scaling fix above: it was already ~16x under the old `log1p` scale too. A model trained on one distribution and scored on a disjoint one can't learn anything about the boundary between healthy and faulty; measured end-to-end, a "trained" autoencoder scored within noise of the untrained frame-energy fallback (ROC AUC 0.8456 vs 0.8463 on the synthetic regression benchmark) — training was buying nothing. Fixed by building the pretraining set from `mock_edge_device.generate_mock_audio` through the real production transform, the same fix applied to `benchmarks/features.py` above.
+
+  This did not make the synthetic benchmark number go up. A properly-trained autoencoder, now actually modelling the real healthy manifold, scores **ROC AUC ≈ 0.71** on `benchmarks.evaluate_synthetic` — worse than the untrained fallback's 0.85, and unmoved by training for longer or on more samples (tried both). The likely reason: the old mismatched model behaved *by accident* like an energy detector, since everything it saw at eval time was equally out-of-distribution to it and reconstruction error tracked input magnitude — which happens to correlate with the fault energy this simulator injects. A model that has genuinely learned the healthy manifold reconstructs some of that fault energy too, since it now has real spectral structure to fall back on. That is a harder, more honest number, not a regression, and it says the current autoencoder architecture/training budget (15 epochs, 800 samples, a 32-dim latent space) has real room to improve against a target that no longer flatters it by mistake.
+
+- **The benchmark harness crashed on Windows.** `benchmarks/evaluate_dataset.py` printed its results table containing a "Δ" character directly to the console. Windows' default console encoding is the legacy ANSI code page, not UTF-8, so `print()` raised `UnicodeEncodeError` after several CPU-minutes of real training — and the run's `--json` output was never written, because the crash landed before the file write. Confirmed by actually hitting it during this session's DCASE rerun. Fixed by reconfiguring stdout/stderr to UTF-8 at the top of `main()`, and by writing the JSON before printing the console table so a display problem can never cost a finished benchmark run again.
 
 ### WebSocket Real-Time Feed
 

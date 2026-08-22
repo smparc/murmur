@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import math
+
 import msgpack
 import numpy as np
 import pytest
 
-from src.ingestion.mock_edge_device import FaultType, generate_mock_audio
+from src.ingestion.mock_edge_device import (
+    FaultType,
+    generate_mock_audio,
+    poisson_tick_probability,
+)
 from src.settings import settings
 
 
@@ -108,6 +114,51 @@ class TestMockAudioGeneration:
 
     def test_node_id_does_not_affect_length(self):
         assert len(generate_mock_audio(0)) == len(generate_mock_audio(3))
+
+
+class TestPoissonTickProbability:
+    """
+    ``run_edge_simulation`` used to start a new fault on some node roughly
+    every 17 seconds, from a flat 3%-per-tick constant that ignored chunk
+    duration entirely. The MTBF-derived replacement must actually track the
+    configured mean time between failures, and stay well-behaved at the
+    extremes rather than exploding or going negative.
+    """
+
+    def test_matches_the_closed_form_poisson_probability(self):
+        # 1 - exp(-dt/mtbf), spelled out independently of the implementation.
+        dt, mtbf = 0.5, 240.0
+        assert poisson_tick_probability(dt, mtbf) == pytest.approx(1 - math.exp(-dt / mtbf))
+
+    def test_short_mtbf_is_frequent(self):
+        assert poisson_tick_probability(0.5, 1.0) > 0.3
+
+    def test_long_mtbf_is_rare(self):
+        # A live demo should not flash a new fault every few seconds; at the
+        # default 240s MTBF and a 0.5s chunk, the per-tick chance must be a
+        # small fraction of a percent, not the old flat 3%.
+        assert poisson_tick_probability(0.5, 240.0) < 0.01
+
+    def test_probability_stays_in_unit_interval(self):
+        # At extreme dt/mtbf ratios, exp(-dt/mtbf) underflows to exactly 0.0
+        # in float64 and the result legitimately saturates at 1.0 rather than
+        # approaching it — that's a float64 fact, not a bug, so the bound
+        # here is inclusive.
+        for mtbf in (0.01, 1.0, 240.0, 1e6):
+            p = poisson_tick_probability(0.5, mtbf)
+            assert 0.0 <= p <= 1.0
+
+    def test_realistic_mtbf_stays_strictly_below_one(self):
+        # For any MTBF actually reachable through settings (seconds to
+        # hours), the probability must stay a genuine probability, not
+        # saturate.
+        for mtbf in (1.0, 240.0, 1e6):
+            assert poisson_tick_probability(0.5, mtbf) < 1.0
+
+    @pytest.mark.parametrize("dt,mtbf", [(0.0, 1.0), (-1.0, 1.0), (0.5, 0.0), (0.5, -1.0)])
+    def test_non_positive_inputs_rejected(self, dt, mtbf):
+        with pytest.raises(ValueError):
+            poisson_tick_probability(dt, mtbf)
 
 
 class TestMessagePackSerialization:
