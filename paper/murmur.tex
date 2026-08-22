@@ -71,13 +71,22 @@ from normal to critical.
 
 I then run the detector against recorded machine audio --- the DCASE 2020 Task 2
 pump set, four units, unsupervised, on the official split --- and the synthetic
-result does not transfer. Mean AUC is $0.7064$ against a published autoencoder
-baseline of $0.7289$, and mean pAUC at $p{=}0.1$ is $0.4061$ against $0.5999$.
-The shortfall is concentrated in precisely the low-false-alarm regime a plant
-would operate in. Per-unit AUC ranges from $0.6404$ to $0.8116$, so a
-single-unit evaluation would have supported almost any conclusion. That is the
-number I would quote, and it says a system scoring $0.9672$ on its own simulator
-is at best comparable to a standard baseline on real audio.
+result does not transfer. A later pass, made by actually executing the harness
+end-to-end with dependencies installed rather than reading it, finds the
+benchmark itself was measuring the wrong system: its feature extractor
+reimplemented the mel transform with \texttt{log1p} compression instead of
+importing the one production computes (dB via \texttt{AmplitudeToDB}), on the
+mistaken belief that importing it required a live message broker. It does not.
+Correcting that --- the same class of defect as the label-distribution hole,
+a benchmark quietly measuring something other than the deployed system ---
+moves mean AUC from $0.7064$ to $0.6730$ against a published autoencoder
+baseline of $0.7289$, and mean pAUC at $p{=}0.1$ from $0.4061$ to $0.2632$
+against $0.5999$. The shortfall is concentrated in precisely the low-false-alarm
+regime a plant would operate in. Per-unit AUC ranges from $0.5729$ to $0.7690$,
+so a single-unit evaluation would have supported almost any conclusion. That is
+the number I would quote, and it says a system scoring $0.9672$ on its own
+simulator falls short of a standard baseline on real audio once the harness
+measures what is actually deployed.
 \end{abstract}
 
 \tableofcontents
@@ -638,31 +647,56 @@ is also built from and therefore the only one that can be compared.
 \toprule
 Unit & AUC & pAUC@10\% & AP & Baseline AUC \\
 \midrule
-pump/id\_00 & 0.8116 & 0.6371 & 0.8996 & 0.7289 \\
-pump/id\_02 & 0.6948 & 0.3811 & 0.7773 & 0.7289 \\
-pump/id\_04 & 0.6787 & 0.2620 & 0.7153 & 0.7289 \\
-pump/id\_06 & 0.6404 & 0.3441 & 0.7257 & 0.7289 \\
+pump/id\_00 & 0.7324 & 0.3483 & 0.8230 & 0.7289 \\
+pump/id\_02 & 0.6175 & 0.2865 & 0.7138 & 0.7289 \\
+pump/id\_04 & 0.7690 & 0.3220 & 0.7830 & 0.7289 \\
+pump/id\_06 & 0.5729 & 0.0961 & 0.5817 & 0.7289 \\
 \midrule
-\textbf{Mean} & \textbf{0.7064} & \textbf{0.4061} & 0.7795 & 0.7289 \\
+\textbf{Mean} & \textbf{0.6730} & \textbf{0.2632} & 0.7254 & 0.7289 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-Mean AUC of $0.7064$ sits $0.0225$ below the published DCASE 2020 autoencoder
-baseline of $0.7289$. Mean pAUC at $p{=}0.1$ is $0.4061$ against a baseline of
-$0.5999$, a shortfall of $0.194$ --- and pAUC is the metric that matters
+Mean AUC of $0.6730$ sits $0.0559$ below the published DCASE 2020 autoencoder
+baseline of $0.7289$. Mean pAUC at $p{=}0.1$ is $0.2632$ against a baseline of
+$0.5999$, a shortfall of $0.337$ --- and pAUC is the metric that matters
 operationally, because it integrates only over the low-false-positive region
 where a plant would actually set its threshold. A system that fires on ten
 percent of healthy pumps has already been muted by its operators.
 
-Two things deserve emphasis. First, per-unit AUC spans $0.6404$ to $0.8116$;
-reporting id\_00 alone would have suggested the system beats the baseline by
-eight points, and reporting id\_06 alone that it loses by nine. Second, and more
-importantly, the same detector scores $\mathrm{F}_1 = 0.9672$ on the corrected
-simulator. The simulator was made harder in Section~\ref{sec:data} and remains
-far easier than a real pump. A generator is a statement of its author's
-assumptions, and this is the measurement of how much those assumptions were
-worth.
+\subsubsection{A benchmark defect found only by executing it}
+
+These are not the numbers this benchmark first produced. The harness's feature
+extractor (\texttt{benchmarks/features.py}) reimplemented the mel transform
+with \texttt{log1p} compression rather than importing the one
+\texttt{src/ingestion} actually computes --- \texttt{AmplitudeToDB} at
+$\text{top\_db}{=}80$ --- on the documented but false belief that importing the
+production module opens a Kafka connection at import time. It does not; nothing
+in it runs at import beyond an ordinary class definition, and a sibling module
+(\texttt{src/evaluation/mimii.py}) already imported it directly without issue.
+\texttt{log1p} and \texttt{AmplitudeToDB} compress dynamic range differently
+enough to change an autoencoder's reconstruction-error scale and its
+sensitivity to quiet spectral detail, so every number this benchmark had ever
+produced, including an earlier revision of the table above, was measured
+against a feature representation the deployed system does not compute. This is
+the identical failure mode as the label-distribution hole in
+Section~\ref{sec:data}: a measurement that is internally consistent and
+completely disconnected from the system it claims to describe. It was found
+not by inspection --- the incorrect docstring had stood unchallenged --- but by
+actually installing the dependencies, running the harness against the real
+corpus, and noticing that a benchmark import path already proven safe
+elsewhere in the same tree was being avoided for a reason that did not hold.
+Correcting the extractor to import the production transform, matching
+\texttt{mimii.py}'s existing practice, produced the table above.
+
+Two things deserve emphasis. First, per-unit AUC spans $0.5729$ to $0.7690$;
+reporting id\_04 alone would have suggested the system beats the baseline by
+four points, and reporting id\_06 alone that it loses by sixteen. Second, and
+more importantly, the same detector scores $\mathrm{F}_1 = 0.9672$ on the
+corrected simulator. The simulator was made harder in Section~\ref{sec:data}
+and remains far easier than a real pump. A generator is a statement of its
+author's assumptions, and this is the measurement of how much those
+assumptions were worth.
 
 The comparison carries two caveats. The baseline figures are transcribed from
 the DCASE 2020 results and should be verified against the official page before
@@ -768,15 +802,18 @@ first time --- revealing that intervals on critical forecasts had been
 approximately twice too narrow, concealed behind an apparently healthy marginal
 coverage figure.
 
-On recorded pump audio the corrected detector reaches a mean AUC of $0.7064$
-against a published baseline of $0.7289$, and a mean pAUC of $0.4061$ against
+On recorded pump audio the corrected detector reaches a mean AUC of $0.6730$
+against a published baseline of $0.7289$, and a mean pAUC of $0.2632$ against
 $0.5999$. It does not beat a standard autoencoder baseline, and it is furthest
 behind in the low-false-alarm regime that determines whether an alerting system
 survives contact with the people it pages. I regard obtaining that number as the
 more valuable outcome than the number itself: the gap between $0.9672$ on the
-simulator and $0.71$ on real audio is the quantity the earlier reported
+simulator and $0.67$ on real audio is the quantity the earlier reported
 $\mathrm{F}_1 = 1.000$ was concealing, and it is now measured rather than
-assumed.
+assumed --- and even that $0.67$ was, until it was actually executed rather
+than read, a measurement of a benchmark's own \texttt{log1p} substitute for the
+production feature transform, not of the system in
+Section~\ref{sec:dcase}.
 
 What this work provides is a pipeline whose claims can be checked: the
 measurement protocol is corrected, the uncertainty quantification does what it
@@ -788,7 +825,7 @@ are untested on real data, because DCASE is single-channel and no public corpus
 provides a synchronised industrial microphone array; producing one, or
 evaluating on MIMII's multi-channel recordings, would exercise the parts of the
 architecture the pump result leaves entirely unmeasured. And the pAUC shortfall
-is the concrete target: a detector at $0.41$ where the baseline reaches $0.60$
+is the concrete target: a detector at $0.26$ where the baseline reaches $0.60$
 has a specific, measurable deficiency in the only operating region that
 matters.
 

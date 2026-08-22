@@ -140,9 +140,20 @@ class TestPoissonTickProbability:
         assert poisson_tick_probability(0.5, 240.0) < 0.01
 
     def test_probability_stays_in_unit_interval(self):
+        # At extreme dt/mtbf ratios, exp(-dt/mtbf) underflows to exactly 0.0
+        # in float64 and the result legitimately saturates at 1.0 rather than
+        # approaching it — that's a float64 fact, not a bug, so the bound
+        # here is inclusive.
         for mtbf in (0.01, 1.0, 240.0, 1e6):
             p = poisson_tick_probability(0.5, mtbf)
-            assert 0.0 <= p < 1.0
+            assert 0.0 <= p <= 1.0
+
+    def test_realistic_mtbf_stays_strictly_below_one(self):
+        # For any MTBF actually reachable through settings (seconds to
+        # hours), the probability must stay a genuine probability, not
+        # saturate.
+        for mtbf in (1.0, 240.0, 1e6):
+            assert poisson_tick_probability(0.5, mtbf) < 1.0
 
     @pytest.mark.parametrize("dt,mtbf", [(0.0, 1.0), (-1.0, 1.0), (0.5, 0.0), (0.5, -1.0)])
     def test_non_positive_inputs_rejected(self, dt, mtbf):
