@@ -19,6 +19,10 @@
   belowskip=10pt,
 }
 
+% Every top-level section starts on a fresh page.
+\let\oldsection\section
+\renewcommand{\section}{\clearpage\oldsection}
+
 \title{\textbf{murmur: Spatio-Temporal Acoustic Monitoring for Predictive
 Maintenance}}
 \author{Matthew Park}
@@ -64,8 +68,8 @@ real number, including one that falls short, as the more valuable outcome of
 this work than the number itself.
 \end{abstract}
 
+\clearpage
 \tableofcontents
-\newpage
 
 \section{Introduction}
 
