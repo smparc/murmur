@@ -215,6 +215,8 @@ All settings are environment variables, validated at import. See
 | `ALERT_WEBHOOK_URL` | *(empty)* | Generic JSON webhook for alerts |
 | `ALERT_COOLDOWN_SECONDS` | `900` | Silence per node and fault after a page; escalation bypasses it |
 | `ALERT_MIN_SEVERITY` | `warning` | Lowest severity that pages |
+| `SIM_FAULT_MTBF_S` | `240.0` | Mean seconds between new fault onsets per node in `murmur-simulate`, as a Poisson process |
+| `SIM_RECOVERY_PROBABILITY` | `0.02` | Chance per tick that a still-mild simulated fault begins to fade out |
 | `TDOA_ENABLED` | `true` | Enable GCC-PHAT source localization |
 | `TDOA_MIN_COHERENCE` | `0.15` | Minimum correlation for a pair to inform the position solve |
 | `TDOA_STALENESS_TOLERANCE` | `0.5` | Max array clock spread (s) treated as one acoustic instant |
@@ -334,6 +336,17 @@ python -m src.evaluation.mimii /path/to/mimii --aggregate mean --json report.jso
 - Breaks results down **per machine**. MIMII difficulty varies enormously by type — valves are near-impossible for reconstruction-based detectors because normal operation is itself impulsive — and a single pooled AUC hides that entirely.
 
 The corpus is optional: the harness is exercised end-to-end in CI against a synthetic corpus in the same layout, so no 26 GB download is needed to run the tests.
+
+`benchmarks/evaluate_dataset.py` (the DCASE/MIMII/IMS harness behind `paper/results/`) did not follow this rule until recently: its feature extractor reimplemented the mel transform with `log1p` compression instead of importing the production one, on the mistaken belief that the production module opens a Kafka connection at import time. It does not — `src/evaluation/mimii.py` already imports it directly — so `benchmarks/features.py` now does the same. `log1p` and production's `AmplitudeToDB(top_db=80)` compress dynamic range differently enough to change an autoencoder's reconstruction-error scale and its sensitivity to quiet detail, which means **the numbers in `paper/results/dcase2020_pump.json` were measured against a feature representation production never computes** and should be treated as superseded until `evaluate_dataset` is rerun against the corrected pipeline.
+
+### Simulator Realism
+
+`src/ingestion/mock_edge_device.py` (`murmur-simulate`) drives the live dashboard demo, and is deliberately kept separate from anything a benchmark number depends on — but it used to be a poor stand-in for a factory even as a demo. Two things were wrong:
+
+- **Fault arrival was a flat 3%-per-tick coin flip.** At a 0.5 s chunk cadence that starts a new degradation episode on some node roughly every 17 seconds, with a 10% chance per tick to snap a mild fault straight back to healthy — a dashboard that never stops flashing alarms and looks nothing like a plant, where a bearing going bad is a weeks-to-months event. Fault onset is now a Poisson process with a configurable mean time between failures (`SIM_FAULT_MTBF_S`, default 240s per node), and recovery — `SIM_RECOVERY_PROBABILITY` — fades a mild fault out over several ticks instead of resetting it instantly.
+- **The signatures themselves were arbitrary tones over white noise.** Bearing squeal is now an amplitude-modulated impact/ring-down train at a ball-pass-frequency-outer, tied to a nominal shaft speed, rather than a continuous sine; rotor imbalance modulates at 1x running speed instead of an unrelated constant; cavitation shapes broadband noise toward the mid/high band instead of flat white noise; and the ambient floor is 1/f (pink) noise plus mains hum and its odd harmonics instead of a single 60 Hz tone over Gaussian noise.
+
+None of this touches detection accuracy — `benchmarks/scenario.py` still drives `generate_mock_audio` on a fixed, labelled schedule for the synthetic regression gate, and nothing about real-data benchmarking depends on the live simulator. It only affects what the live demo sounds and looks like.
 
 ### WebSocket Real-Time Feed
 
