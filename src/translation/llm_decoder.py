@@ -2,13 +2,14 @@
 LLM Telemetry Decoder — FastAPI inference service.
 
 Receives ST-GNN acoustic embeddings together with detector context (anomaly
-score, severity, TTF), projects the embedding into the LLM's latent space and
-generates a human-readable diagnostic.
+score, severity, degradation score), projects the embedding into the LLM's
+latent space and generates a human-readable diagnostic.
 
 The WebSocket payload carries *structured* fields alongside the prose. The
-dashboard renders severity and TTF from those fields, never by pattern-matching
-the generated text — model output is not a stable interface, and a monitoring
-UI that changes colour based on whether the LLM said "critical" is a liability.
+dashboard renders severity and degradation from those fields, never by
+pattern-matching the generated text — model output is not a stable interface,
+and a monitoring UI that changes colour based on whether the LLM said
+"critical" is a liability.
 
 Endpoints
 ---------
@@ -17,11 +18,26 @@ Endpoints
 ``GET  /ready``               strict readiness (503 until models are resident)
 ``GET  /metrics``             Prometheus exposition
 ``WS   /ws/telemetry``        real-time dashboard feed
+
+Credentials
+-----------
+Two keys, because the two callers are trusted very differently:
+
+- ``MURMUR_API_KEY`` (write) — ``POST /generate_telemetry`` and ``/metrics``.
+  Held by the inference worker and Prometheus.
+- ``MURMUR_DASHBOARD_KEY`` (read) — the WebSocket feed only. The dashboard is a
+  browser app, so this key ships in its JavaScript bundle and must be assumed
+  visible to anyone who can load the page.
+
+Previously the dashboard held the write key, so reading it out of the bundle
+was enough to post fabricated telemetry — and fabricated anomalies. The write
+key is still accepted on the feed, since its holder is strictly more trusted.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -51,9 +67,9 @@ from src.observability.metrics import (
     ANOMALY_SCORE,
     ANOMALY_Z_SCORE,
     CONTENT_TYPE,
+    DEGRADATION_SCORE,
     END_TO_END_LATENCY,
     MODEL_LOADED,
-    TTF_PREDICTION,
     render,
     track_inference,
     track_latency,
@@ -81,14 +97,14 @@ WS_SEND_TIMEOUT_SECONDS = 5.0
 # ---------------------------------------------------------------------------
 
 
-class TTFInterval(BaseModel):
+class DegradationInterval(BaseModel):
     """
-    A calibrated band around the failure forecast.
+    A calibrated band around the degradation score.
 
-    A bare sigmoid is not a probability — nothing in the training objective
-    makes 0.73 mean "fails 73% of the time". These bounds come from split
-    conformal calibration and carry a finite-sample coverage guarantee, which
-    is what makes the forecast safe to schedule maintenance against.
+    The score is a regression onto fault severity in ``[0, 1]`` — not a time and
+    not a probability: nothing makes 0.73 mean "fails 73% of the time". These
+    bounds come from split conformal calibration on the same per-node path the
+    worker serves, and carry a finite-sample coverage guarantee for the score.
     """
 
     point: float = Field(ge=0.0, le=1.0)
@@ -107,13 +123,20 @@ class TelemetryRequest(BaseModel):
     gnn_embedding: list[float]
     anomaly_score: float = Field(0.0, ge=0.0, le=1.0)
     anomaly_severity: Literal["normal", "warning", "critical"] = "normal"
-    ttf_prediction: float = Field(0.0, ge=0.0, le=1.0)
+    # Estimated degradation of the machine nearest this microphone: 0 is
+    # healthy, 1 is the most severe fault the model was trained on. It is a
+    # severity score, not a time-to-failure and not a failure probability.
+    degradation_score: float = Field(0.0, ge=0.0, le=1.0)
     is_anomaly: bool = False
     z_score: float = 0.0
+    # Robust z of the node's recent median against its frozen post-warmup
+    # anchor. Non-zero means the node has drifted as a whole — a slow creep the
+    # per-frame `z_score` cannot show, because the rolling baseline follows it.
+    drift_z: float = 0.0
     # Optional enrichments. Absent when the pipeline has no conformal
     # calibration, or when TDOA is disabled or the array failed to resolve a
     # source — both are degraded-but-valid states, not errors.
-    ttf_interval: TTFInterval | None = None
+    degradation_interval: DegradationInterval | None = None
     source_position: list[float] | None = None
     # Spectral attribution and the catalogue match derived from it. Both are
     # computed by the worker, which is where the autoencoder that produced the
@@ -159,6 +182,7 @@ class AnomalyBlock(BaseModel):
     severity: Literal["normal", "warning", "critical"]
     is_anomaly: bool
     z_score: float
+    drift_z: float = 0.0
 
 
 class TelemetryResponse(BaseModel):
@@ -166,9 +190,9 @@ class TelemetryResponse(BaseModel):
     timestamp: float
     telemetry: str
     anomaly: AnomalyBlock
-    ttf_prediction: float
+    degradation_score: float
     generated: bool = Field(description="True when an LLM produced the text; False when templated.")
-    ttf_interval: TTFInterval | None = None
+    degradation_interval: DegradationInterval | None = None
     source_position: list[float] | None = None
     explanation: dict | None = None
     diagnosis: dict | None = None
@@ -269,11 +293,30 @@ state = _AppState()
 # ---------------------------------------------------------------------------
 
 
+def _key_matches(supplied: str | None, expected: str) -> bool:
+    """Constant-time comparison, so a key cannot be recovered byte by byte from timing."""
+    if not supplied or not expected:
+        return False
+    return hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _can_read_feed(supplied: str | None) -> bool:
+    """The live feed accepts the dashboard (read) key or the write key."""
+    return _key_matches(supplied, settings.DASHBOARD_API_KEY) or _key_matches(
+        supplied, settings.API_KEY
+    )
+
+
 def require_api_key(x_api_key: Annotated[str | None, Header()] = None) -> None:
-    """Reject unauthenticated writes when ``MURMUR_API_KEY`` is configured."""
+    """
+    Reject unauthenticated writes when ``MURMUR_API_KEY`` is configured.
+
+    Only the write key is accepted. The dashboard key is deliberately not: it
+    is public to anyone who can load the dashboard.
+    """
     if not settings.AUTH_ENABLED:
         return
-    if x_api_key != settings.API_KEY:
+    if not _key_matches(x_api_key, settings.API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key",
@@ -346,6 +389,12 @@ async def lifespan(app: FastAPI):
 
     if settings.AUTH_ENABLED:
         log.info("API key authentication is ENABLED")
+        if not settings.DASHBOARD_API_KEY:
+            log.warning(
+                "MURMUR_DASHBOARD_KEY is unset, so the live feed accepts only the write "
+                "key. A browser dashboard would have to embed MURMUR_API_KEY in its "
+                "bundle; set a separate read-only MURMUR_DASHBOARD_KEY instead."
+            )
     else:
         log.warning(
             "MURMUR_API_KEY is unset — /generate_telemetry is UNAUTHENTICATED. "
@@ -487,7 +536,7 @@ def _build_prompt(request: TelemetryRequest) -> str:
         f"{_SEVERITY_DESCRIPTION.get(request.anomaly_severity, 'in an unknown state')}.",
         f"Anomaly score: {request.anomaly_score:.3f} "
         f"(robust z={request.z_score:.2f}). "
-        f"Failure probability: {request.ttf_prediction:.1%}.",
+        f"Degradation score: {request.degradation_score:.2f} on a 0-1 scale.",
     ]
 
     if request.explanation and (summary := request.explanation.get("summary")):
@@ -518,7 +567,7 @@ def _template_telemetry(request: TelemetryRequest) -> str:
     return (
         f"Node {request.node_id}: {headline} "
         f"Anomaly score {request.anomaly_score:.3f} (z={request.z_score:.2f}); "
-        f"modelled failure probability {request.ttf_prediction:.1%}."
+        f"degradation score {request.degradation_score:.2f}/1."
     )
 
 
@@ -584,7 +633,7 @@ async def generate_telemetry(request: TelemetryRequest) -> TelemetryResponse:
     node_label = str(request.node_id)
     ANOMALY_SCORE.labels(node_id=node_label).set(request.anomaly_score)
     ANOMALY_Z_SCORE.labels(node_id=node_label).set(request.z_score)
-    TTF_PREDICTION.labels(node_id=node_label).set(request.ttf_prediction)
+    DEGRADATION_SCORE.labels(node_id=node_label).set(request.degradation_score)
     if request.is_anomaly:
         ANOMALY_COUNT.labels(node_id=node_label, severity=request.anomaly_severity).inc()
 
@@ -610,10 +659,11 @@ async def generate_telemetry(request: TelemetryRequest) -> TelemetryResponse:
             severity=request.anomaly_severity,
             is_anomaly=request.is_anomaly,
             z_score=round(request.z_score, 4),
+            drift_z=round(request.drift_z, 4),
         ),
-        ttf_prediction=round(request.ttf_prediction, 4),
+        degradation_score=round(request.degradation_score, 4),
         generated=generated,
-        ttf_interval=request.ttf_interval,
+        degradation_interval=request.degradation_interval,
         source_position=request.source_position,
         explanation=request.explanation,
         diagnosis=request.diagnosis,
@@ -634,7 +684,7 @@ def require_metrics_key(x_api_key: Annotated[str | None, Header()] = None) -> No
     """
     Gate ``/metrics`` behind the same key as writes.
 
-    The exposition carries per-node anomaly counts, z-scores and TTF forecasts —
+    The exposition carries per-node anomaly counts, z-scores and degradation scores —
     a live map of which machines in the plant are failing. On a LoadBalancer
     Service that is public. ``/health`` and ``/ready`` stay open because
     kubelet probes cannot present credentials, and neither carries per-node data.
@@ -644,7 +694,9 @@ def require_metrics_key(x_api_key: Annotated[str | None, Header()] = None) -> No
     """
     if not settings.AUTH_ENABLED or not settings.METRICS_REQUIRE_AUTH:
         return
-    if x_api_key != settings.API_KEY:
+    # Write key only: /metrics is a per-machine failure map, and the dashboard
+    # key is public to anyone who can load the dashboard.
+    if not _key_matches(x_api_key, settings.API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing X-API-Key",
@@ -667,7 +719,7 @@ async def ws_telemetry(websocket: WebSocket) -> None:
     """Live telemetry feed for the dashboard."""
     if settings.AUTH_ENABLED:
         supplied = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
-        if supplied != settings.API_KEY:
+        if not _can_read_feed(supplied):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 

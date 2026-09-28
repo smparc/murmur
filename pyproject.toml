@@ -71,6 +71,7 @@ murmur-ingest = "src.ingestion.cuda_stream_processor:main"
 murmur-simulate = "src.ingestion.mock_edge_device:main"
 murmur-worker = "src.inference.worker:main"
 murmur-train = "src.training.train_pipeline:main"
+murmur-rebaseline = "src.inference.control:main"
 
 [project.urls]
 Homepage = "https://github.com/smparc/murmur"

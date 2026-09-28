@@ -140,6 +140,15 @@ class Settings:
         default_factory=lambda: _env_int("ANOMALY_WARMUP_FRAMES", 50)
     )
     ANOMALY_WINDOW: int = field(default_factory=lambda: _env_int("ANOMALY_WINDOW", 500))
+    # Compare the median of the last ANOMALY_DRIFT_WINDOW raw scores against a
+    # baseline frozen at the end of warmup, so a fault that creeps in below the
+    # per-frame threshold is caught instead of being absorbed. A departure stays
+    # flagged until an operator runs `murmur-rebaseline`; see
+    # src/detection/anomaly_detector.py for why time alone never clears it.
+    ANOMALY_DRIFT_GUARD: bool = field(
+        default_factory=lambda: _env_bool("ANOMALY_DRIFT_GUARD", True)
+    )
+    ANOMALY_DRIFT_WINDOW: int = field(default_factory=lambda: _env_int("ANOMALY_DRIFT_WINDOW", 50))
 
     # -- Array liveness --
     # A graph snapshot ideally contains every microphone. But requiring all of
@@ -157,6 +166,12 @@ class Settings:
     # Below this many reporting microphones the graph is too sparse to convolve
     # meaningfully, so nothing is emitted and the operator is told why.
     ARRAY_MIN_NODES: int = field(default_factory=lambda: _env_int("ARRAY_MIN_NODES", 2))
+    # Kafka key for everything that describes the array as a whole. The worker
+    # can only assemble a snapshot from windows it receives, so every window of
+    # one array must reach one consumer; keying by array rather than by
+    # microphone is what guarantees that for any partition count. It also means
+    # one array is one consumer — see deploy/k8s/03-inference-deployment.yaml.
+    ARRAY_ID: str = field(default_factory=lambda: _env_str("ARRAY_ID", "array-0"))
 
     # -- LLM --
     LLM_MODEL_NAME: str = field(
@@ -219,7 +234,14 @@ class Settings:
     # -- Security --
     # Empty means unauthenticated. Acceptable inside a private cluster; the
     # startup log warns loudly so it is never an accident in production.
+    #
+    # The write credential: submits telemetry (which feeds the live feed and the
+    # Prometheus gauges) and reads /metrics. Held by the worker and Prometheus only.
     API_KEY: str = field(default_factory=lambda: _env_str("MURMUR_API_KEY", ""))
+    # The read credential: the dashboard's live WebSocket feed and nothing else.
+    # It is baked into the browser bundle, so treat it as visible to anyone who
+    # can load the page — which is exactly why it must not be the write key.
+    DASHBOARD_API_KEY: str = field(default_factory=lambda: _env_str("MURMUR_DASHBOARD_KEY", ""))
     CORS_ORIGINS: str = field(
         default_factory=lambda: _env_str("CORS_ORIGINS", "http://localhost:3000")
     )
@@ -300,6 +322,17 @@ class Settings:
         default_factory=lambda: _env_str("ALERT_MIN_SEVERITY", "warning")
     )
 
+    # -- Telemetry delivery --
+    # The API is the live feed, not the system of record, and alerting does not
+    # depend on it. So a submission is retried briefly for transient failures
+    # (timeouts, 5xx), then written to TELEMETRY_DLQ_TOPIC with the reason
+    # rather than dropped — offsets only advance once that write is acknowledged.
+    TELEMETRY_MAX_RETRIES: int = field(default_factory=lambda: _env_int("TELEMETRY_MAX_RETRIES", 2))
+    TELEMETRY_RETRY_BACKOFF: float = field(
+        default_factory=lambda: _env_float("TELEMETRY_RETRY_BACKOFF", 0.25)
+    )
+    TELEMETRY_TIMEOUT: float = field(default_factory=lambda: _env_float("TELEMETRY_TIMEOUT", 10.0))
+
     # -- Forecast uncertainty --
     # Target miscoverage for conformal prediction intervals: 0.1 gives 90%
     # coverage. See src/forecasting/conformal.py.
@@ -331,6 +364,7 @@ class Settings:
             "INFERENCE_PORT",
             "ANOMALY_WARMUP_FRAMES",
             "ANOMALY_WINDOW",
+            "ANOMALY_DRIFT_WINDOW",
         ]
         for name in positive:
             if getattr(self, name) <= 0:
@@ -391,6 +425,26 @@ class Settings:
                 f"ARRAY_MIN_NODES ({self.ARRAY_MIN_NODES}) exceeds the number of "
                 f"microphones ({len(self.MIC_COORDS)}); no snapshot could ever be released"
             )
+        if not self.ARRAY_ID.strip():
+            errors.append("ARRAY_ID must be a non-empty string")
+        if self.DASHBOARD_API_KEY and self.DASHBOARD_API_KEY == self.API_KEY:
+            errors.append(
+                "MURMUR_DASHBOARD_KEY must differ from MURMUR_API_KEY: the dashboard key "
+                "is shipped to every browser, so sharing it hands out write access"
+            )
+        if self.DASHBOARD_API_KEY and not self.API_KEY:
+            errors.append(
+                "MURMUR_DASHBOARD_KEY is set but MURMUR_API_KEY is not, which would leave "
+                "writes unauthenticated while reads require a key"
+            )
+        if self.TELEMETRY_MAX_RETRIES < 0:
+            errors.append(f"TELEMETRY_MAX_RETRIES must be >= 0, got {self.TELEMETRY_MAX_RETRIES}")
+        if self.TELEMETRY_RETRY_BACKOFF < 0:
+            errors.append(
+                f"TELEMETRY_RETRY_BACKOFF must be >= 0, got {self.TELEMETRY_RETRY_BACKOFF}"
+            )
+        if self.TELEMETRY_TIMEOUT <= 0:
+            errors.append(f"TELEMETRY_TIMEOUT must be > 0, got {self.TELEMETRY_TIMEOUT}")
         if self.RATE_LIMIT_MAX_KEYS <= 0:
             errors.append(f"RATE_LIMIT_MAX_KEYS must be > 0, got {self.RATE_LIMIT_MAX_KEYS}")
 
@@ -450,6 +504,16 @@ class Settings:
         return f"{self.PROCESSED_TOPIC}-spatial"
 
     @property
+    def TELEMETRY_DLQ_TOPIC(self) -> str:
+        """Scored payloads the telemetry API did not accept, with the reason."""
+        return f"{self.PROCESSED_TOPIC}-telemetry-dlq"
+
+    @property
+    def CONTROL_TOPIC(self) -> str:
+        """Operator commands to the worker, such as re-baselining a node."""
+        return f"{self.PROCESSED_TOPIC}-control"
+
+    @property
     def MEL_FRAMES_PER_CHUNK(self) -> int:
         """Time frames torchaudio produces per chunk (centred STFT)."""
         return self.SAMPLES_PER_CHUNK // self.HOP_LENGTH + 1
@@ -467,7 +531,8 @@ class Settings:
         out: dict[str, object] = {}
         for f in fields(self):
             value = getattr(self, f.name)
-            out[f.name] = "***redacted***" if f.name == "API_KEY" and value else value
+            secret = f.name in {"API_KEY", "DASHBOARD_API_KEY"}
+            out[f.name] = "***redacted***" if secret and value else value
         return out
 
 

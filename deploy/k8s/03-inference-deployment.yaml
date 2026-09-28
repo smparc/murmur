@@ -12,9 +12,16 @@ metadata:
   namespace: murmur
 type: Opaque
 stringData:
-  # Replace before deploying. An empty key disables authentication entirely,
-  # and this Service is internet-reachable.
+  # Replace both before deploying. An empty MURMUR_API_KEY disables
+  # authentication entirely, and this Service is internet-reachable.
+  #
+  # MURMUR_API_KEY is the write key: the worker submits telemetry with it and
+  # Prometheus reads /metrics with it. MURMUR_DASHBOARD_KEY is read-only (the
+  # live feed) and is built into the dashboard bundle as
+  # NEXT_PUBLIC_DASHBOARD_KEY, so assume anyone who can load the dashboard
+  # has it. They must differ; the API refuses to start if they do not.
   MURMUR_API_KEY: "change-me-before-deploying"
+  MURMUR_DASHBOARD_KEY: "change-me-too-read-only"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -58,6 +65,11 @@ spec:
                 secretKeyRef:
                   name: murmur-secrets
                   key: MURMUR_API_KEY
+            - name: MURMUR_DASHBOARD_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: murmur-secrets
+                  key: MURMUR_DASHBOARD_KEY
           # Liveness hits /health (up), readiness hits /ready (models resident).
           # Pointing both at the same endpoint — as before — means a pod that is
           # merely slow to warm up gets killed rather than held out of rotation.
@@ -118,6 +130,12 @@ spec:
 # Streaming worker: consumes windowed spectrograms, runs the model chain and
 # posts telemetry. This is the service that joins ingestion to serving; without
 # it the topics are written and never read.
+#
+# One replica per microphone array, and no autoscaler. The worker needs every
+# microphone of its array to assemble a snapshot, so windows are keyed by
+# ARRAY_ID and an array is consumed by exactly one worker; a second replica for
+# the same array would sit idle. More arrays means more Deployments, each with
+# its own ARRAY_ID and MIC_COORDS. See 04-autoscaling-hpa.yaml.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

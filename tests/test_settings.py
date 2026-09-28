@@ -58,6 +58,29 @@ class TestValidation:
         with pytest.raises(ConfigError, match="N_FFT"):
             Settings()
 
+    def test_dashboard_key_equal_to_write_key_rejected(self, monkeypatch):
+        """The dashboard key is public by construction; sharing it hands out writes."""
+        monkeypatch.setenv("MURMUR_API_KEY", "same")
+        monkeypatch.setenv("MURMUR_DASHBOARD_KEY", "same")
+        with pytest.raises(ConfigError, match="MURMUR_DASHBOARD_KEY must differ"):
+            Settings()
+
+    def test_dashboard_key_without_write_key_rejected(self, monkeypatch):
+        monkeypatch.setenv("MURMUR_API_KEY", "")
+        monkeypatch.setenv("MURMUR_DASHBOARD_KEY", "read-only")
+        with pytest.raises(ConfigError, match="writes unauthenticated"):
+            Settings()
+
+    def test_blank_array_id_rejected(self, monkeypatch):
+        monkeypatch.setenv("ARRAY_ID", "  ")
+        with pytest.raises(ConfigError, match="ARRAY_ID"):
+            Settings()
+
+    def test_negative_telemetry_retries_rejected(self, monkeypatch):
+        monkeypatch.setenv("TELEMETRY_MAX_RETRIES", "-1")
+        with pytest.raises(ConfigError, match="TELEMETRY_MAX_RETRIES"):
+            Settings()
+
     def test_attention_head_divisibility_enforced(self, monkeypatch):
         monkeypatch.setenv("GNN_HIDDEN_CHANNELS", "130")
         monkeypatch.setenv("GNN_NUM_HEADS", "4")
@@ -136,3 +159,10 @@ class TestDescribe:
         described = Settings().describe()
         assert described["API_KEY"] == "***redacted***"
         assert "super-secret-value" not in str(described)
+
+    def test_dashboard_key_is_redacted(self, monkeypatch):
+        monkeypatch.setenv("MURMUR_API_KEY", "write-secret")
+        monkeypatch.setenv("MURMUR_DASHBOARD_KEY", "read-secret")
+        described = Settings().describe()
+        assert described["DASHBOARD_API_KEY"] == "***redacted***"
+        assert "read-secret" not in str(described)

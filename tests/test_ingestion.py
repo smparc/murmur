@@ -21,9 +21,11 @@ class _RecordingProducer:
 
     def __init__(self) -> None:
         self.topics: list[str] = []
+        self.messages: list[tuple[str, bytes | None, bytes | None]] = []
 
     def produce(self, topic, key=None, value=None, callback=None) -> None:
         self.topics.append(topic)
+        self.messages.append((topic, key, value))
 
 
 class TestFrameTopicIsOptIn:
@@ -55,6 +57,37 @@ class TestFrameTopicIsOptIn:
     def test_frame_topic_returns_when_asked_for(self, override_settings):
         override_settings(PUBLISH_FRAME_TOPIC=True)
         assert settings.PROCESSED_TOPIC in self._publish_once()
+
+
+class TestArrayKeying:
+    """
+    The worker assembles a snapshot from every microphone of an array. Windows
+    keyed by microphone hashed onto different partitions, so a second worker
+    split the array and neither could complete a snapshot. Keyed by array, every
+    window of an array reaches one consumer whatever the partition count.
+    """
+
+    def _windowed_messages(self, override_settings, array_id: str = "hall-3"):
+        from src.ingestion.cuda_stream_processor import SlidingWindowBuffer, _publish
+
+        override_settings(ARRAY_ID=array_id, PUBLISH_FRAME_TOPIC=False)
+        producer = _RecordingProducer()
+        buffer = SlidingWindowBuffer(window_size=1, num_nodes=settings.NUM_NODES)
+        spec = np.zeros((settings.N_MELS, settings.MEL_FRAMES_PER_CHUNK), dtype=np.float32)
+        for node in range(settings.NUM_NODES):
+            _publish(producer, buffer, node_id=node, timestamp=1.0, spec=spec)
+        return [m for m in producer.messages if m[0] == settings.WINDOWED_TOPIC]
+
+    def test_every_microphone_shares_one_key(self, override_settings):
+        messages = self._windowed_messages(override_settings)
+        assert len(messages) == settings.NUM_NODES
+        assert {key for _, key, _ in messages} == {b"hall-3"}
+
+    def test_window_carries_its_array_id(self, override_settings):
+        messages = self._windowed_messages(override_settings)
+        payloads = [msgpack.unpackb(value, raw=False) for _, _, value in messages]
+        assert {p["array_id"] for p in payloads} == {"hall-3"}
+        assert sorted(p["node_id"] for p in payloads) == list(range(settings.NUM_NODES))
 
 
 class TestMockAudioGeneration:

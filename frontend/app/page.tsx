@@ -22,7 +22,13 @@ import {
 const WS_URL =
   process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws/telemetry";
 const HEALTH_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
+// Read-only dashboard credential. Every NEXT_PUBLIC_* value is inlined into the
+// JavaScript bundle, so anyone who can load this page can read it — which is
+// why it must be MURMUR_DASHBOARD_KEY and never the worker's MURMUR_API_KEY.
+// The server accepts it for the live feed only; it cannot submit telemetry,
+// read /metrics, or trigger alerts. Per-user access control belongs in an
+// authenticating proxy in front of this page, not in this key.
+const DASHBOARD_KEY = process.env.NEXT_PUBLIC_DASHBOARD_KEY || "";
 
 const MAX_LOGS = 50;
 const MAX_CHART_POINTS = 60;
@@ -59,7 +65,9 @@ type TelemetryFrame = {
     is_anomaly: boolean;
     z_score: number;
   };
-  ttf_prediction: number;
+  // 0 = healthy, 1 = most severe trained fault. A severity score, not a
+  // time-to-failure and not a probability, so it is never shown as a percent.
+  degradation_score: number;
   generated: boolean;
 };
 
@@ -79,7 +87,7 @@ type NodeStatus = {
   score: number;
   zScore: number;
   severity: Severity;
-  ttf: number;
+  degradation: number;
   lastUpdate: string;
   receivedAt: number;
 };
@@ -144,7 +152,7 @@ export default function MurmurDashboard() {
       try {
         const res = await fetch(`${HEALTH_URL}/health`, {
           signal: controller.signal,
-          headers: API_KEY ? { "X-API-Key": API_KEY } : undefined,
+          headers: DASHBOARD_KEY ? { "X-API-Key": DASHBOARD_KEY } : undefined,
         });
         if (!cancelled && res.ok) setHealth(await res.json());
       } catch {
@@ -165,7 +173,7 @@ export default function MurmurDashboard() {
     const receivedAt = Date.now();
     const time = new Date(receivedAt).toLocaleTimeString();
     const severity: Severity = frame.anomaly?.severity ?? "normal";
-    const ttfPercent = (frame.ttf_prediction ?? 0) * 100;
+    const degradation = Math.round((frame.degradation_score ?? 0) * 1000) / 1000;
     logCounter.current += 1;
 
     setLogs((prev) => [
@@ -189,10 +197,10 @@ export default function MurmurDashboard() {
       // Nodes report near-simultaneously; merging into the current row keeps
       // one x-position per instant instead of one per message.
       if (last && last.time === time) {
-        const merged = { ...last, [key]: Math.round(ttfPercent * 10) / 10 };
+        const merged = { ...last, [key]: degradation };
         return [...prev.slice(0, -1), merged];
       }
-      const row: ChartRow = { time, [key]: Math.round(ttfPercent * 10) / 10 };
+      const row: ChartRow = { time, [key]: degradation };
       return [...prev.slice(-(MAX_CHART_POINTS - 1)), row];
     });
 
@@ -202,7 +210,7 @@ export default function MurmurDashboard() {
         score: frame.anomaly?.score ?? 0,
         zScore: frame.anomaly?.z_score ?? 0,
         severity,
-        ttf: ttfPercent,
+        degradation,
         lastUpdate: time,
         receivedAt,
       },
@@ -215,8 +223,11 @@ export default function MurmurDashboard() {
     setConnectionStatus("connecting");
     closedByUs.current = false;
 
-    const url = API_KEY
-      ? `${WS_URL}?api_key=${encodeURIComponent(API_KEY)}`
+    // Browsers cannot set headers on a WebSocket handshake, so the key travels
+    // as a query parameter. That lands in proxy access logs — tolerable only
+    // because this key is read-only and already public in the bundle.
+    const url = DASHBOARD_KEY
+      ? `${WS_URL}?api_key=${encodeURIComponent(DASHBOARD_KEY)}`
       : WS_URL;
     const ws = new WebSocket(url);
     wsRef.current = ws;
@@ -334,7 +345,10 @@ export default function MurmurDashboard() {
                   />
                 </div>
                 <div className="text-2xl font-bold">
-                  {status.ttf.toFixed(1)}%
+                  {status.degradation.toFixed(2)}
+                  <span className="ml-1 text-xs font-normal text-gray-500">
+                    degradation
+                  </span>
                 </div>
                 <div className="mt-1 font-mono text-xs text-gray-500">
                   score {status.score.toFixed(4)} · z {status.zScore.toFixed(2)}
@@ -352,7 +366,7 @@ export default function MurmurDashboard() {
         <div className="rounded-xl border border-gray-800 bg-gray-900 p-6 shadow-xl lg:col-span-2">
           <h2 className="mb-4 flex items-center gap-2 text-lg font-semibold">
             <AlertTriangle className="text-amber-500" size={20} />
-            Liquid Network Failure Forecast (TTF)
+            Estimated Degradation (0 = healthy, 1 = severe)
           </h2>
           <div className="h-80 w-full">
             {chartData.length === 0 ? (
@@ -370,8 +384,7 @@ export default function MurmurDashboard() {
                   <YAxis
                     stroke="#9CA3AF"
                     fontSize={12}
-                    domain={[0, 100]}
-                    unit="%"
+                    domain={[0, 1]}
                   />
                   <Tooltip
                     contentStyle={{

@@ -2,7 +2,7 @@
 Tests that the spatial and uncertainty enrichments survive the API boundary.
 
 These exist because the failure mode is silent. Pydantic defaults to
-``extra='ignore'``, so a worker can POST ``ttf_interval`` and
+``extra='ignore'``, so a worker can POST ``degradation_interval`` and
 ``source_position``, receive a cheerful 200, and have both fields dropped before
 they ever reach a dashboard — with nothing in any log to say so.
 """
@@ -21,7 +21,7 @@ def _payload(**overrides) -> dict:
         "gnn_embedding": [0.01] * settings.GNN_EMBEDDING_DIM,
         "anomaly_score": 0.5,
         "anomaly_severity": "warning",
-        "ttf_prediction": 0.4,
+        "degradation_score": 0.4,
         "is_anomaly": True,
         "z_score": 3.2,
     }
@@ -41,10 +41,10 @@ _INTERVAL = {
 
 class TestConformalInterval:
     def test_interval_is_echoed_not_dropped(self, api_client):
-        resp = api_client.post("/generate_telemetry", json=_payload(ttf_interval=_INTERVAL))
+        resp = api_client.post("/generate_telemetry", json=_payload(degradation_interval=_INTERVAL))
         assert resp.status_code == 200
 
-        interval = resp.json()["ttf_interval"]
+        interval = resp.json()["degradation_interval"]
         assert interval is not None, "the calibrated band was silently discarded"
         assert interval["lower"] == 0.15
         assert interval["upper"] == 0.65
@@ -54,12 +54,14 @@ class TestConformalInterval:
         """No calibration is a degraded state, not a failure."""
         resp = api_client.post("/generate_telemetry", json=_payload())
         assert resp.status_code == 200
-        assert resp.json()["ttf_interval"] is None
+        assert resp.json()["degradation_interval"] is None
 
     def test_out_of_range_bounds_rejected(self, api_client):
         bad = dict(_INTERVAL, upper=1.7)
         assert (
-            api_client.post("/generate_telemetry", json=_payload(ttf_interval=bad)).status_code
+            api_client.post(
+                "/generate_telemetry", json=_payload(degradation_interval=bad)
+            ).status_code
             == 422
         )
 
@@ -95,15 +97,15 @@ class TestBroadcast:
         with api_client.websocket_connect("/ws/telemetry") as ws:
             api_client.post(
                 "/generate_telemetry",
-                json=_payload(ttf_interval=_INTERVAL, source_position=[3.5, 7.0, 3.0]),
+                json=_payload(degradation_interval=_INTERVAL, source_position=[3.5, 7.0, 3.0]),
             )
 
             for _ in range(10):
                 frame = ws.receive_json()
-                if frame.get("ttf_interval") is not None:
+                if frame.get("degradation_interval") is not None:
                     break
             else:  # pragma: no cover - only on regression
                 raise AssertionError("no broadcast frame carried the interval")
 
-            assert frame["ttf_interval"]["confidence"] == 0.9
+            assert frame["degradation_interval"]["confidence"] == 0.9
             assert frame["source_position"] == [3.5, 7.0, 3.0]

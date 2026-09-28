@@ -15,6 +15,12 @@ is against what other systems get on the same data.
    the same split with the same metric definition — pAUC in particular is
    reported at ``p = 0.1`` and is not comparable to a full AUC.
 
+   **The pAUC figures are McClish-standardised** (the official evaluator calls
+   ``sklearn.metrics.roc_auc_score(max_fpr=0.1)``; chance = 0.5). Compare them
+   with ``standardized_partial_roc_auc``, never with ``partial_roc_auc``, which
+   is mean recall over the strip (chance = 0.05) and reads far lower for the
+   same detector.
+
    Source: https://dcase.community/challenge2020/
            task-unsupervised-detection-of-anomalous-sounds-results
 """

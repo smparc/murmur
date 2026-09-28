@@ -123,7 +123,14 @@ class TestDetectionReport:
         scores = np.r_[np.zeros(10), np.ones(10)]
         labels = np.r_[np.zeros(10), np.ones(10)].astype(int)
         report = detection_report(scores, labels)
-        assert set(report) == {"auc", "pauc", "max_fpr", "n_normal", "n_anomalous"}
+        assert set(report) == {
+            "auc",
+            "pauc",
+            "pauc_standardized",
+            "max_fpr",
+            "n_normal",
+            "n_anomalous",
+        }
         assert report["n_normal"] == 10
         assert report["n_anomalous"] == 10
 
@@ -292,3 +299,65 @@ class TestEndToEndBenchmark:
     def test_empty_sample_list_rejected(self):
         with pytest.raises(ValueError):
             evaluate([], score_fn=lambda x: x, device=torch.device("cpu"))
+
+
+class TestStandardizedPartialAUC:
+    """
+    The paper compared this module's mean-recall pAUC (chance 0.05) against the
+    DCASE baseline's McClish-standardised pAUC (chance 0.5) as if they were one
+    scale. Both are affine in the same partial area, so conversion is exact.
+    """
+
+    def test_anchor_points(self):
+        from src.evaluation.metrics import to_standardized_pauc
+
+        assert to_standardized_pauc(1.0) == pytest.approx(1.0)  # perfect
+        assert to_standardized_pauc(0.05) == pytest.approx(0.5)  # chance
+        # A detector blind at low FPR: the McClish floor is ~0.47, not 0.
+        assert to_standardized_pauc(0.0) == pytest.approx(0.5 * (1 - 0.005 / 0.095))
+
+    def test_matches_scikit_learn(self):
+        sklearn_metrics = pytest.importorskip("sklearn.metrics")
+        from src.evaluation.metrics import standardized_partial_auc
+
+        rng = np.random.default_rng(0)
+        for _ in range(5):
+            labels = rng.integers(0, 2, 400)
+            scores = rng.normal(labels * 0.8, 1.0)
+            expected = sklearn_metrics.roc_auc_score(labels, scores, max_fpr=0.1)
+            assert standardized_partial_auc(scores, labels, 0.1) == pytest.approx(expected)
+
+    def test_reduces_to_full_auc_at_p_one(self):
+        from src.evaluation.metrics import standardized_partial_auc
+
+        rng = np.random.default_rng(1)
+        labels = rng.integers(0, 2, 200)
+        scores = rng.normal(labels * 0.5, 1.0)
+        assert standardized_partial_auc(scores, labels, 1.0) == pytest.approx(
+            roc_auc(scores, labels)
+        )
+
+    def test_paper_results_compare_like_with_like(self):
+        """
+        Guards the paper's DCASE comparison: the saved results must carry the
+        standardised figure, it must be the exact conversion of the mean-recall
+        one, and it is that figure — not `mean_pauc_10` — that is set against
+        the published baseline.
+        """
+        import json
+        from pathlib import Path
+
+        from src.evaluation.metrics import to_standardized_pauc
+
+        path = Path(__file__).resolve().parents[1] / "paper" / "results" / "dcase2020_pump.json"
+        results = json.loads(path.read_text(encoding="utf-8"))
+        for row in results["per_group"].values():
+            assert row["pauc_10_standardized"] == pytest.approx(
+                to_standardized_pauc(row["pauc_10"])
+            )
+            assert row["pauc_vs_baseline"] == pytest.approx(
+                row["pauc_10_standardized"] - row["baseline_pauc"]
+            )
+        assert results["mean_pauc_10_standardized"] == pytest.approx(
+            to_standardized_pauc(results["mean_pauc_10"])
+        )

@@ -9,9 +9,15 @@
 **Murmur** is a spatio-temporal acoustic monitoring system. It turns ambient
 mechanical noise into a predictive maintenance signal: continuous multi-channel
 audio from a sparse microphone grid is localised across a graph of the facility,
-scored for anomalies against each sensor's own baseline, projected forward into
-a Time-to-Failure estimate by a continuous-time network, and rendered as
-human-readable telemetry on a live dashboard.
+scored for anomalies against each sensor's own baseline, given a per-machine
+degradation score by a continuous-time network, and rendered as human-readable
+telemetry on a live dashboard.
+
+> **The degradation score is not a time-to-failure or a probability.** It is a
+> regression onto fault severity in `[0, 1]` (0 = healthy, 1 = the most severe
+> fault in training). Nothing in the label has a time axis, and nothing makes
+> 0.7 mean "70% likely to fail". Earlier versions called it TTF and displayed it
+> as a failure probability; both were wrong.
 
 ---
 
@@ -34,7 +40,7 @@ graph TD
     subgraph Worker["Inference Worker"]
         KT --> A[Assemble full array snapshot]
         A --> ST[ST-GNN → embedding sequence]
-        ST --> LNN[Liquid Network → TTF]
+        ST --> LNN[Liquid Network → degradation score]
         A --> AD[Autoencoder + robust z-score]
         LNN --> POST[POST /generate_telemetry]
         AD --> POST
@@ -79,13 +85,13 @@ scored telemetry to the API.
 | **Telemetry Translation** | Multimodal Audio LLM | Autoregressive diagnostics from a trained projection adapter; degrades to templated text when no LLM is resident. |
 | **Model Serving** | FastAPI + WebSocket | REST, live WebSocket feed, API-key auth, rate limiting, split liveness/readiness probes. |
 | **Configuration** | Validated settings | Environment-driven and validated at import, including the microphone layout. |
-| **Observability** | Prometheus + MLflow | Latency, throughput, anomaly counts, TTF, consumer lag, end-to-end frame age. |
+| **Observability** | Prometheus + MLflow | Latency, throughput, anomaly counts, degradation, consumer lag, end-to-end frame age, dead-lettered telemetry. |
 | **Orchestration** | Dagster | Topology validation, detector health, drift evaluation against a baseline. |
-| **Deployment** | Docker & Kubernetes | Non-root images, resource limits, PDB, GPU-aware and lag-driven autoscaling. |
+| **Deployment** | Docker & Kubernetes | Non-root images, resource limits, PDB, GPU-aware API autoscaling; one worker per microphone array. |
 | **CI/CD** | GitHub Actions | Lint, format, tests on 3 Python versions, Kafka integration, frontend build, manifest validation, image publish. |
 | **Frontend** | React, Next.js, Recharts | Per-node forecast series, exponential-backoff reconnect, staleness indicators. |
-| **Benchmarking** | MIMII / ToyADMOS | Scores the production detector on recorded machine faults; AUC and pAUC per machine type. |
-| **Testing** | pytest | 470 tests across models, detection, localization, calibration, ingestion, worker, API, auth and configuration — all pass on a real Python 3.12 / CPU-only install, verified end-to-end. |
+| **Benchmarking** | MIMII / ToyADMOS / DCASE | Scores the production detector on recorded machine faults; AUC and pAUC per machine type, with pAUC on the DCASE scale for baseline comparison. |
+| **Testing** | pytest | 515 tests across models, detection, localization, calibration, ingestion, worker, API, auth and configuration — all pass on a real Python 3.12 / CPU-only install. |
 
 ---
 
@@ -97,7 +103,7 @@ murmur/
 ├── deploy/
 │   ├── Dockerfile.ingest              # CUDA ingestion image
 │   ├── Dockerfile.inference           # API + worker image
-│   └── k8s/                           # Namespace, Kafka, deployments, HPAs, PDB
+│   └── k8s/                           # Namespace, Kafka, deployments, API HPA, PDB
 ├── frontend/                          # Next.js dashboard (App Router + Tailwind)
 ├── orchestration/data_pipeline.py     # Dagster assets and drift schedule
 ├── src/
@@ -107,7 +113,9 @@ murmur/
 │   ├── forecasting/
 │   │   ├── conformal.py               # Split-conformal prediction intervals
 │   │   └── liquid_network.py          # Closed-form Continuous-time network
-│   ├── inference/worker.py            # Windows → models → telemetry
+│   ├── inference/
+│   │   ├── worker.py                  # Windows → models → telemetry
+│   │   └── control.py                 # murmur-rebaseline operator command
 │   ├── ingestion/
 │   │   ├── cuda_stream_processor.py   # Kafka → batched GPU log-mel → windows
 │   │   ├── mock_edge_device.py        # Multi-fault factory simulator
@@ -120,7 +128,7 @@ murmur/
 │   ├── observability/metrics.py       # Prometheus metrics
 │   ├── training/train_pipeline.py     # Four-stage training + conformal calibration
 │   └── translation/llm_decoder.py     # FastAPI + WebSocket telemetry service
-└── tests/                             # 470 unit + integration tests
+└── tests/                             # 515 unit + integration tests
 ```
 
 ---
@@ -170,7 +178,7 @@ Then open <http://localhost:3000>.
 
 To skip the multi-gigabyte model download during development, set
 `LLM_ENABLED=false`. The service still emits full structured telemetry — anomaly
-score, severity, TTF — with the narrative field templated. Responses carry a
+score, severity, degradation — with the narrative field templated. Responses carry a
 `generated` flag so the dashboard can label templated text as such.
 
 ### Production deployment
@@ -202,7 +210,14 @@ All settings are environment variables, validated at import. See
 | `ANOMALY_Z_THRESHOLD` | `3.0` | Robust-z above which a frame is flagged |
 | `LLM_MODEL_NAME` | `Qwen/Qwen1.5-1.8B` | HuggingFace model ID |
 | `LLM_ENABLED` | `true` | Set `false` to serve templated telemetry |
-| `MURMUR_API_KEY` | *(empty)* | Enables `X-API-Key` auth when set |
+| `MURMUR_API_KEY` | *(empty)* | Write key: `POST /generate_telemetry` and `/metrics`. Held by the worker and Prometheus. Enables auth when set |
+| `MURMUR_DASHBOARD_KEY` | *(empty)* | Read-only key for the WebSocket feed. Build it into the dashboard as `NEXT_PUBLIC_DASHBOARD_KEY`; it is visible to anyone who can load the page, so it must differ from the write key |
+| `ARRAY_ID` | `array-0` | Kafka key for array-wide messages. One worker per array |
+| `ANOMALY_DRIFT_GUARD` | `true` | Flag a sustained departure from the post-warmup baseline, even when no single frame is anomalous |
+| `ANOMALY_DRIFT_WINDOW` | `50` | Frames in the recent median the drift guard compares |
+| `TELEMETRY_MAX_RETRIES` | `2` | Retries for a timed-out or 5xx submission before it is dead-lettered |
+| `TELEMETRY_RETRY_BACKOFF` | `0.25` | Base of the exponential retry backoff (s) |
+| `TELEMETRY_TIMEOUT` | `10.0` | Per-attempt HTTP timeout for telemetry submission (s) |
 | `RATE_LIMIT_PER_MINUTE` | `1200` | Must exceed `NUM_NODES` per `CHUNK_DURATION` |
 | `RATE_LIMIT_MAX_KEYS` | `10000` | Cap on retained rate-limit buckets, so the limiter cannot itself exhaust memory |
 | `METRICS_REQUIRE_AUTH` | `true` | Gate `/metrics` behind the API key; set `false` for an in-cluster scraper |
@@ -268,6 +283,49 @@ history, using a median/MAD robust z-score. Median over mean is deliberate: a
 developing fault contaminates the very statistics used to detect it, and the
 mean is far more easily dragged along.
 
+**A persistent fault must not become the new normal.** From one microphone's
+score alone, a legitimate change of operating point and a fault that has
+stopped getting worse look the same, so the scorer does not guess:
+
+- Flagged frames are **not** admitted to the rolling baseline. When they were, a
+  step fault displaced the median once it filled half the 500-frame window and
+  read as normal from frame 251 on — about two minutes, after which it never
+  alerted again.
+- A **drift guard** compares the median of recent frames against an anchor frozen
+  at the end of warmup, so a fault that creeps in below the per-frame threshold
+  is caught even though the rolling baseline follows it.
+- Accepting a change as the new normal is an explicit operator action:
+
+  ```bash
+  murmur-rebaseline --node 2 --reason "pump P-201 re-rated to 1450 rpm"
+  ```
+
+  The command goes to the worker over the control topic and is logged with who
+  asked and why. It needs broker access, not the dashboard key.
+
+### Telemetry delivery
+
+The telemetry API is the live feed; alerts are raised by the worker directly and
+do not depend on it. A submission that times out or gets a 5xx is retried with
+backoff (`TELEMETRY_MAX_RETRIES`); a 429 or other 4xx is not, since retrying
+cannot help. Anything still undelivered is written, with the reason, to
+`<PROCESSED_TOPIC>-telemetry-dlq`, and offsets advance only once that write is
+acknowledged — if it is not, the worker rewinds and re-consumes the batch. So a
+scored result is never silently lost, but it is also never replayed into the
+live feed later, where it would be shown as current. After one payload exhausts
+its retries during an outage, the rest of that snapshot skips them, so an outage
+cannot stall the consumer.
+
+### Scaling
+
+The worker needs every microphone of an array to assemble a snapshot, so windows
+(and TDOA snapshots) are keyed by `ARRAY_ID` and one array is consumed by
+exactly one worker. There is no worker autoscaler: a second replica for the same
+array receives no partitions. More arrays means more worker Deployments, each
+with its own `ARRAY_ID` and `MIC_COORDS`. Ingestion stays at one replica per
+array while TDOA is enabled, because localisation needs every microphone's raw
+audio in one process.
+
 ### Liquid Network
 
 `ncps`' `CfC.forward` reduces each step's timespan with
@@ -306,17 +364,19 @@ Because the mel transform discards phase, this has to run in the **ingestion** s
 
 **Known limitation:** the default array is coplanar, so elevation is unobservable in principle — a source above the plane and its mirror image below produce identical delays. The solver constrains to a horizontal plane by default and returns `None` rather than inventing a plausible `z`. A full 3-D fix needs a non-coplanar array of at least five microphones.
 
-### Forecast Uncertainty (Conformal Prediction)
+### Degradation Uncertainty (Conformal Prediction)
 
-The Liquid Network emits a sigmoid. Nothing in the training objective makes that a calibrated probability — 0.73 does not mean "fails 73% of the time" — yet it is exactly the number a planner would schedule an outage against.
+The Liquid Network emits a sigmoid regressed onto severity. Nothing in the training objective makes that a probability — 0.73 does not mean "fails 73% of the time" — yet a bare point estimate is exactly the kind of number a planner would schedule an outage against.
 
-`src/forecasting/conformal.py` applies **split conformal prediction**, which converts the point estimate into an interval with a *finite-sample, distribution-free* coverage guarantee. No Gaussian assumption, no asymptotics, no retraining. Telemetry payloads gain a `ttf_interval` block:
+`src/forecasting/conformal.py` applies **split conformal prediction**, which converts the point estimate into an interval with a *finite-sample, distribution-free* coverage guarantee. No Gaussian assumption, no asymptotics, no retraining. Telemetry payloads gain a `degradation_interval` block:
 
 ```json
-"ttf_interval": { "point": 0.32, "lower": 0.0, "upper": 0.80, "confidence": 0.9 }
+"degradation_interval": { "point": 0.32, "lower": 0.0, "upper": 0.80, "confidence": 0.9 }
 ```
 
-Two details that carry the guarantee:
+Three details that carry the guarantee:
+
+- **Calibration uses the served quantity.** The worker ships one score per microphone from that microphone's embedding trajectory. Training and calibration run the same `per_node_forecast` path, with per-microphone labels. They previously used the pooled graph readout, so the LNN and the interval radii were fitted to a quantity that was never served.
 
 - **The calibration set is disjoint from both training *and* validation.** Training residuals are optimistically small; the validation set was used for early stopping and is no longer exchangeable. The pipeline halves the test split — one half calibrates, the other verifies realised coverage.
 - **Calibration is Mondrian (per-severity), not marginal.** Marginal coverage is a weak promise: on heteroscedastic errors it hits 90% overall while systematically under-covering the *critical* bucket — the only machines anyone is monitoring for. Measured on a held-out heteroscedastic set, marginal calibration covers the critical stratum at 86% while over-covering healthy machines at 97.6%; grouping restores critical to 92% **and** tightens healthy intervals from 0.32 to 0.20.
@@ -332,7 +392,7 @@ python -m src.evaluation.mimii /path/to/mimii --aggregate mean --json report.jso
 ```
 
 - The mel transform is **imported from the ingestion service**, not reimplemented, so the benchmark cannot silently drift from what production computes. Train/serve skew of exactly this kind is the most common reason offline metrics fail to survive deployment.
-- Reports **pAUC** alongside AUC. A detector can post a respectable AUC while being useless below the false-alarm budget any plant would tolerate; here pAUC is mean recall over FPR ∈ [0, 0.1], so a detector blind in that regime scores ~0 rather than ~0.47.
+- Reports **pAUC** alongside AUC. A detector can post a respectable AUC while being useless below the false-alarm budget any plant would tolerate. Two scales are reported, and they are not interchangeable: `pauc` is mean recall over FPR ∈ [0, 0.1] (chance 0.05, and a detector blind in that regime scores ~0), while `pauc_standardized` is the McClish standardisation that scikit-learn, the official DCASE evaluator and every published DCASE baseline use (chance 0.5, blind ≈ 0.47). **Compare against a published baseline on the standardised scale only** — on DCASE 2020 pump the same detector reads 0.41 on one and 0.69 on the other.
 - Breaks results down **per machine**. MIMII difficulty varies enormously by type — valves are near-impossible for reconstruction-based detectors because normal operation is itself impulsive — and a single pooled AUC hides that entirely.
 
 The corpus is optional: the harness is exercised end-to-end in CI against a synthetic corpus in the same layout, so no 26 GB download is needed to run the tests.
@@ -361,7 +421,7 @@ Two more defects surfaced once the dependencies were actually installed and the 
 ### WebSocket Real-Time Feed
 
 The dashboard connects to `ws://localhost:8000/ws/telemetry` and receives
-structured frames — severity, anomaly score, robust z, TTF — alongside the
+structured frames — severity, anomaly score, robust z, degradation — alongside the
 prose. It never pattern-matches generated text, because model output is not a
 stable interface. New clients receive a short replay buffer so an operator
 opening the page mid-shift sees context rather than a blank screen; that buffer

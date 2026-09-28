@@ -1,8 +1,11 @@
 """
 Liquid Neural Network for continuous-time predictive maintenance.
 
-A Closed-form Continuous-time (CfC) core wrapped in a task head that forecasts
-Time-to-Failure. CfC solves the underlying ODE analytically rather than by
+A Closed-form Continuous-time (CfC) core wrapped in a task head that estimates a
+**degradation score** in ``[0, 1]``: the severity of the fault audible at a
+microphone, where 0 is healthy. It is trained by regression onto fault severity,
+so it is neither a time-to-failure nor a failure probability, and should not be
+presented as either. CfC solves the underlying ODE analytically rather than by
 numerical integration, which is what makes a genuinely continuous-time model
 fast enough to serve online.
 
@@ -26,7 +29,7 @@ from ncps.wirings import AutoNCP
 
 class AcousticForecastingLNN(nn.Module):
     """
-    Forecasts failure probability from a sequence of acoustic embeddings.
+    Estimates a degradation score from a sequence of acoustic embeddings.
 
     Parameters
     ----------
@@ -35,8 +38,8 @@ class AcousticForecastingLNN(nn.Module):
     hidden_neurons:
         Total neurons in the neural-circuit wiring.
     output_dim:
-        Predicted quantities. ``1`` is failure probability; more can carry
-        auxiliary targets such as severity or a horizon estimate.
+        Predicted quantities. ``1`` is the degradation score; more could carry
+        auxiliary targets such as a horizon estimate, given labels for one.
     dropout:
         Applied in the task head.
     """
@@ -103,8 +106,8 @@ class AcousticForecastingLNN(nn.Module):
             ``(batch, seq_len)`` inter-observation intervals in seconds.
             Omit for a uniform clock.
         return_sequence:
-            When ``True``, return the failure probability at every timestep —
-            a forecast trajectory rather than a single number.
+            When ``True``, return the degradation score at every timestep —
+            a trajectory rather than a single number.
 
         Returns
         -------
@@ -165,9 +168,35 @@ class AcousticForecastingLNN(nn.Module):
     def predict_trajectory(
         self, x: torch.Tensor, timespans: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Per-timestep failure probabilities, for the dashboard forecast plot."""
+        """Per-timestep degradation scores, for the dashboard trend plot."""
         self.eval()
         return self.forward(x, timespans=timespans, return_sequence=True)
+
+
+def per_node_forecast(
+    lnn: AcousticForecastingLNN,
+    node_sequence: torch.Tensor,
+    timespans: torch.Tensor,
+) -> torch.Tensor:
+    """
+    One degradation score per microphone, from that microphone's own trajectory.
+
+    ``node_sequence`` is the ST-GNN's ``(B, S, N, E)`` per-node output and
+    ``timespans`` the ``(B, S)`` inter-frame intervals; returns ``(B, N)``.
+
+    This is the single definition of the forecast path. Training, conformal
+    calibration and the inference worker all call it, so the LNN is fitted,
+    calibrated and served on the same quantity. Previously training and
+    calibration used the pooled graph readout while the worker served per-node
+    embeddings — a distribution the model had never seen, with interval radii
+    fitted to a different quantity entirely.
+    """
+    if node_sequence.dim() != 4:
+        raise ValueError(f"expected (B, S, N, E), got {tuple(node_sequence.shape)}")
+    B, S, N, E = node_sequence.shape
+    flat = node_sequence.permute(0, 2, 1, 3).reshape(B * N, S, E)
+    node_timespans = timespans.repeat_interleave(N, dim=0)
+    return lnn(flat, timespans=node_timespans).view(B, N)
 
 
 def main() -> None:  # pragma: no cover - manual inspection helper

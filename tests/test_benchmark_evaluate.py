@@ -62,7 +62,7 @@ class TestEvaluateDataset:
     def test_report_renders_a_markdown_table(self, tiny_dcase):
         results = evaluate("dcase", tiny_dcase, epochs=2, seed=0)
         report = format_report(results)
-        assert "| Machine | AUC | pAUC@10% |" in report
+        assert "| Machine | AUC | Baseline AUC | pAUC@10% (std) | Baseline pAUC |" in report
         assert "fan/id_00" in report
         assert "Mean AUC" in report
 

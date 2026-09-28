@@ -1,5 +1,6 @@
 """Tests for the training pipeline improvements."""
 
+import pytest
 import torch
 
 from src.training.train_pipeline import (
@@ -20,21 +21,35 @@ class TestSyntheticDataGeneration:
             in_channels=64,
         )
         assert x.shape == (50, 10, 256), f"x shape: {x.shape}"
-        assert y.shape == (50, 1), f"y shape: {y.shape}"
+        # One degradation label per microphone — the quantity the worker serves.
+        assert y.shape == (50, 4), f"y shape: {y.shape}"
         assert ts.shape == (50, 10), f"ts shape: {ts.shape}"
 
-    def test_ttf_range(self):
-        """TTF labels should be in [0, 1]."""
+    def test_degradation_range(self):
+        """Degradation labels should be in [0, 1]."""
         _, y, _ = generate_degradation_data(100, 10, 4, 64, anomaly_ratio=0.5)
-        assert y.min() >= 0.0, f"TTF below 0: {y.min()}"
-        assert y.max() <= 1.0, f"TTF above 1: {y.max()}"
+        assert y.min() >= 0.0, f"degradation below 0: {y.min()}"
+        assert y.max() <= 1.0, f"degradation above 1: {y.max()}"
 
     def test_anomaly_ratio(self):
-        """Roughly the expected fraction should be degrading (high TTF)."""
+        """Roughly the expected fraction of sequences should contain a degrading machine."""
         _, y, _ = generate_degradation_data(1000, 10, 4, 64, anomaly_ratio=0.2)
-        high_ttf = (y > 0.1).float().mean().item()
+        degrading = (y > 0.1).any(dim=1).float().mean().item()
         # Should be roughly 20% (with some variance)
-        assert 0.1 < high_ttf < 0.35, f"Anomaly ratio out of range: {high_ttf}"
+        assert 0.1 < degrading < 0.35, f"Anomaly ratio out of range: {degrading}"
+
+    def test_only_the_source_microphone_carries_the_fault(self):
+        """
+        A fault is labelled at the machine it originates from. Neighbours hear it
+        attenuated, but the machines they monitor are healthy, so their labels
+        stay in the healthy band — otherwise a per-node score could not say which
+        machine is failing.
+        """
+        _, y, _ = generate_degradation_data(500, 10, 4, 64, anomaly_ratio=1.0, seed=0)
+        above_healthy = (y > 0.1).sum(dim=1)
+        assert above_healthy.max().item() <= 1
+        # Every sequence has exactly one source; its label is the row maximum.
+        assert (y.max(dim=1).values >= 0.05).all()
 
     def test_timespans_positive(self):
         """All timespans should be positive."""
@@ -44,12 +59,14 @@ class TestSyntheticDataGeneration:
     def test_normal_samples_low_energy(self):
         """Normal samples should have lower energy than degraded ones."""
         x, y, _ = generate_degradation_data(200, 10, 4, 64, anomaly_ratio=0.3)
-        normal_mask = y.squeeze() < 0.1
-        anomaly_mask = y.squeeze() > 0.3
+        # Per microphone: (sequences, seq, nodes, mels) -> energy per (sequence, node).
+        energy = x.reshape(200, 10, 4, 64).pow(2).mean(dim=(1, 3))
+        normal_mask = y < 0.1
+        anomaly_mask = y > 0.3
 
         if normal_mask.sum() > 0 and anomaly_mask.sum() > 0:
-            normal_energy = x[normal_mask].pow(2).mean()
-            anomaly_energy = x[anomaly_mask].pow(2).mean()
+            normal_energy = energy[normal_mask].mean()
+            anomaly_energy = energy[anomaly_mask].mean()
             assert anomaly_energy > normal_energy, "Anomalous data should have higher energy"
 
 
@@ -113,3 +130,59 @@ class TestComputeMetrics:
         targets = torch.randn(10, 1).sigmoid()
         metrics = compute_metrics(preds, targets)
         assert set(metrics.keys()) == {"mse", "mae", "precision", "recall", "f1"}
+
+
+class TestPerNodeTrainServeParity:
+    """
+    The worker serves one degradation score per microphone. Training and
+    conformal calibration used the pooled graph readout instead, so the LNN and
+    the interval radii were fitted to a quantity that is never served.
+    """
+
+    @pytest.fixture
+    def models(self, sample_edge_topology):
+        from src.forecasting.liquid_network import AcousticForecastingLNN
+        from src.mapping.st_gnn_model import SpatioTemporalGNN
+
+        edge_index, edge_weight, num_nodes = sample_edge_topology
+        st_gnn = SpatioTemporalGNN(
+            in_channels=16, hidden_channels=16, embedding_dim=16, num_nodes=num_nodes, num_heads=2
+        ).eval()
+        lnn = AcousticForecastingLNN(input_dim=16, hidden_neurons=16).eval()
+        return st_gnn, lnn, edge_index, edge_weight, num_nodes
+
+    def test_forward_forecast_is_per_node(self, models):
+        from src.training.train_pipeline import _forward_forecast
+
+        st_gnn, lnn, edge_index, edge_weight, num_nodes = models
+        x, _, ts = generate_degradation_data(6, 8, num_nodes, 16, seed=0)
+        with torch.no_grad():
+            preds = _forward_forecast(st_gnn, lnn, x, ts, edge_index, edge_weight)
+        assert preds.shape == (6, num_nodes)
+
+    def test_training_path_is_the_serving_path(self, models):
+        """Each node's score is the LNN applied to that node's own trajectory."""
+        from src.forecasting.liquid_network import per_node_forecast
+
+        st_gnn, lnn, edge_index, edge_weight, num_nodes = models
+        x, _, ts = generate_degradation_data(3, 8, num_nodes, 16, seed=1)
+        with torch.no_grad():
+            _, node_sequence = st_gnn(
+                x, edge_index, edge_weight, return_sequence=True, return_nodes=True
+            )
+            batched = per_node_forecast(lnn, node_sequence, ts)
+            for node in range(num_nodes):
+                alone = lnn(node_sequence[:, :, node, :], timespans=ts).squeeze(-1)
+                assert torch.allclose(batched[:, node], alone, atol=1e-5)
+
+    def test_calibration_uses_every_nodes_forecast(self, models):
+        from src.training.train_pipeline import calibrate_forecaster
+
+        st_gnn, lnn, edge_index, edge_weight, num_nodes = models
+        x, y, ts = generate_degradation_data(40, 8, num_nodes, 16, seed=2)
+        calibrator, coverage = calibrate_forecaster(
+            st_gnn, lnn, {"test": (x, y, ts)}, edge_index, edge_weight, alpha=0.1
+        )
+        # Half the sequences calibrate, and every microphone in each contributes.
+        assert calibrator.n_calibration == 20 * num_nodes
+        assert coverage["n"] == 20 * num_nodes

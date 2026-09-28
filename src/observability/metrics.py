@@ -93,9 +93,10 @@ ANOMALY_Z_SCORE = Gauge(
     ["node_id"],
 )
 
-TTF_PREDICTION = Gauge(
-    "murmur_ttf_prediction",
-    "Latest TTF prediction per node (0=healthy, 1=imminent failure)",
+DEGRADATION_SCORE = Gauge(
+    "murmur_degradation_score",
+    "Latest estimated degradation per node (0=healthy, 1=most severe trained fault). "
+    "A severity score, not a time-to-failure or a probability.",
     ["node_id"],
 )
 
@@ -154,8 +155,14 @@ NODE_DROPPED = Counter(
 
 TELEMETRY_DROPPED = Counter(
     "murmur_telemetry_dropped_total",
-    "Scored payloads the telemetry API refused or was unreachable for",
+    "Scored payloads lost outright: not accepted by the API and not dead-lettered either",
     ["node_id"],
+)
+
+TELEMETRY_DEAD_LETTERED = Counter(
+    "murmur_telemetry_dead_lettered_total",
+    "Scored payloads the API did not accept, kept on the dead-letter topic, by reason",
+    ["reason"],
 )
 
 # -- Spatial acoustics --
@@ -293,6 +300,7 @@ __all__ = [
     "ARRAY_CLOCK_SPREAD",
     "ARRAY_NODES_REPORTING",
     "CONTENT_TYPE",
+    "DEGRADATION_SCORE",
     "END_TO_END_LATENCY",
     "FRAMES_DROPPED",
     "FRAMES_PROCESSED",
@@ -305,8 +313,8 @@ __all__ = [
     "REQUEST_LATENCY",
     "SNAPSHOTS_EMITTED",
     "SOURCE_LOCALIZED",
+    "TELEMETRY_DEAD_LETTERED",
     "TELEMETRY_DROPPED",
-    "TTF_PREDICTION",
     "record_consumer_lag",
     "render",
     "track_inference",

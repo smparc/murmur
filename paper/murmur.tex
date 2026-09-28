@@ -36,9 +36,9 @@ Maintenance}}
 Industrial acoustic monitoring promises to detect mechanical failure before it
 occurs, from sound alone. Murmur is a system built for that task: microphones
 feed a spatio-temporal graph neural network over an acoustic topology, whose
-embeddings drive a continuous-time liquid network forecasting time-to-failure,
-with a convolutional autoencoder scoring per-node anomalies against each
-microphone's own rolling baseline.
+embeddings drive a continuous-time liquid network estimating a per-machine
+degradation score, with a convolutional autoencoder scoring per-node anomalies
+against each microphone's own rolling baseline.
 
 This paper audits that codebase, built by three independent coding agents
 working concurrently, and reports a substantially corrected system.
@@ -49,23 +49,27 @@ untracked files a routine worktree cleanup would have destroyed. A prior
 read-only audit correctly identified eleven defects and fixed none of them.
 
 The most consequential finding was not a crash but a measurement. A reported
-time-to-failure $\mathrm{F}_1$ of $1.000$ was an artifact of a $0.4$-wide gap
+degradation $\mathrm{F}_1$ of $1.000$ was an artifact of a $0.4$-wide gap
 in the training label distribution straddling the decision threshold --- the
 classes were separable by construction --- which also starved conformal
 calibration in exactly the high-risk severity strata the guarantee exists to
 cover. Correcting the eleven defects and re-measuring gives $\mathrm{F}_1 =
 0.9672$, MAE $0.0313$ (from $0.0608$), and conformal coverage of $0.89$ against
-a nominal $0.90$, with per-stratum radii restored for the first time.
+a nominal $0.90$, with per-stratum radii restored for the first time. An
+external review then found that the per-machine fix had reached inference but
+not training or calibration; measured on the served per-microphone path,
+$\mathrm{F}_1 = 0.9714$ at coverage $0.89$.
 
 On the DCASE 2020 Task 2 pump set --- real recordings, unsupervised, official
-split --- the synthetic result does not transfer: mean AUC $0.6730$ against a
-published baseline of $0.7289$, mean pAUC $0.2632$ against $0.5999$,
-concentrated in exactly the low-false-alarm regime a plant would operate in.
-That number itself moved once more on a later pass: executing the benchmark
-harness end-to-end, rather than reading it, found its feature extractor was
-scoring a transform the deployed system does not compute. I regard obtaining a
-real number, including one that falls short, as the more valuable outcome of
-this work than the number itself.
+split --- mean AUC is $0.6730$ against a published baseline of $0.7289$. Mean
+pAUC at $p{=}0.1$, on the standardised scale the baseline is published on, is
+$0.6122$ against $0.5999$: roughly level at low false-alarm rates, and behind
+across the full curve. A previous version of this paper compared pAUC across
+two scales and reported a shortfall of $0.337$ in exactly that regime. That and
+an earlier feature-extraction defect were both found by executing measurements
+rather than reading them, and I regard obtaining a real number, including one
+that falls short, as the more valuable outcome of this work than the number
+itself.
 \end{abstract}
 
 \clearpage
@@ -89,8 +93,8 @@ spectrograms on the GPU, and buffered into temporal windows. A spatio-temporal
 graph neural network treats the array as a graph --- microphones are nodes,
 inverse-distance acoustic coupling gives the edges --- and produces a per-node
 embedding at every timestep. Those embeddings drive a closed-form continuous-time
-network (CfC) that integrates over real inter-frame intervals to forecast
-time-to-failure. In parallel, a convolutional autoencoder scores each frame
+network (CfC) that integrates over real inter-frame intervals to estimate a
+per-machine degradation score. In parallel, a convolutional autoencoder scores each frame
 against that microphone's own rolling baseline using a median/MAD robust
 $z$-score.
 
@@ -130,7 +134,8 @@ designed throughout; the failure is that concurrent agents produce work whose
 \emph{integration} nobody owns.
 
 The second motivation is the more important one. The system reported an
-$\mathrm{F}_1$ of $1.000$ on time-to-failure classification. A perfect score on
+$\mathrm{F}_1$ of $1.000$ on degradation classification (then mislabelled
+time-to-failure; Section~\ref{sec:review}). A perfect score on
 a hard problem should be read as evidence about the measurement rather than the
 model, and it was: the label distribution had a hole in it, and the decision
 threshold sat in the hole.
@@ -161,7 +166,7 @@ worktree, deduplicated against the implementations that had already landed, and
 --- critically --- wired into the runtime rather than left as dead code
 (Section~\ref{sec:artifact}).
 
-\item \textbf{A verifiable artifact}: 452 automated tests, a Kafka integration
+\item \textbf{A verifiable artifact}: 515 automated tests, a Kafka integration
 test that genuinely executes rather than skipping, and infrastructure validated
 against the tooling that consumes it (Section~\ref{sec:artifact}).
 \end{enumerate}
@@ -283,12 +288,19 @@ so nothing is fabricated for a microphone that said nothing.
 These executed without error while disabling a documented capability.
 
 \textbf{A facility-level forecast presented as four machine-level forecasts.}
-One time-to-failure value and one embedding were computed from the pooled graph
+One degradation score and one embedding were computed from the pooled graph
 readout and copied into every node's payload. The dashboard's four per-node
 cards were therefore identical by construction --- an operator reading four
 independent machine forecasts was reading one number four times. The ST-GNN now
 exposes per-node embeddings and each microphone receives a forecast derived from
 its own trajectory.
+
+As first applied, this fix was incomplete, and external review caught it
+(Section~\ref{sec:review}): only the inference path changed. Training, conformal
+calibration, and the language-model projector all still used the pooled graph
+readout, so the served per-node numbers came from a distribution the forecaster
+had never been trained on, with interval radii fitted to a different quantity.
+All four now share one per-node code path.
 
 \textbf{A write-only Kafka topic.} Every spectrogram frame from every node was
 serialised, compressed, and shipped to a broker that no consumer subscribed to,
@@ -309,7 +321,7 @@ topology --- is severe. The cache now keys on shape and confirms tensor identity
 holding a reference so the address cannot be recycled.
 
 \textbf{An unauthenticated metrics endpoint.} \texttt{/metrics} published
-per-node anomaly counts, $z$-scores, and failure forecasts --- a live map of
+per-node anomaly counts, $z$-scores, and degradation scores --- a live map of
 which machines in the plant are failing --- without authentication even when an
 API key was configured, on a LoadBalancer-exposed service.
 
@@ -372,6 +384,72 @@ working directory on \texttt{sys.path} to fall back on. Six modules failed at
 collection, which aborts the entire run --- including the integration job, whose
 own test was deselected.
 
+\subsection{External review}
+\label{sec:review}
+
+After the audit above, an external reviewer read the corrected tree and raised
+seven questions. Each was reproduced before being changed, and each is now
+covered by regression tests. All seven were live after the audit, and two ---
+the incomplete per-node fix and the pAUC comparison --- were introduced by it.
+
+\textbf{A write credential in the browser.} The dashboard authenticated with
+\texttt{NEXT\_\allowbreak PUBLIC\_\allowbreak API\_\allowbreak KEY}, which Next.js inlines into the client bundle,
+and the server accepted that same key for telemetry writes. Anyone able to load
+the dashboard could read it and post fabricated anomalies. Pages are raised by
+the worker rather than the API, so these would not have reached Slack or
+PagerDuty, but the live feed would have displayed them as real and the
+Prometheus gauges would have recorded them. It also opened \texttt{/metrics}.
+There are now two keys: a write key held by the worker and Prometheus, and
+a read-only dashboard key accepted on the WebSocket feed and nowhere else. The
+service refuses to start if they are equal, and comparisons are constant-time.
+
+\textbf{Silent telemetry loss.} A failed submission was counted and the batch's
+offsets committed anyway, so a scored result the API never accepted existed
+nowhere. Transient failures are now retried with backoff; anything still
+undelivered goes to a dead-letter topic with the reason, and offsets advance
+only once that write is acknowledged. If it is not, the worker seeks back to the
+start of the batch --- merely withholding a commit, the approach the ingestion
+service also takes, redelivers nothing, since the next commit covers the
+skipped offsets too. Dead-lettered results are deliberately not replayed into
+the live feed, where they would be presented as current.
+
+\textbf{A severity score named as a time.} The training label is fault
+severity, $y = s$, with no time axis anywhere in the generator, yet it was
+called time-to-failure throughout and displayed as ``failure probability''. It
+is now named for what it is --- a degradation score in $[0, 1]$ --- in the API,
+the metrics, the alerts, the dashboard, and this paper.
+
+\textbf{Train/serve skew in the forecaster.} Described under Class~2 above: the
+per-node inference fix had not reached training, calibration, or the projector.
+
+\textbf{A persistent fault becomes the baseline.} Flagged frames were admitted
+to each node's rolling 500-frame window on the reasoning that the median would
+keep them in check. It does, until they are half the window. In the reviewer's
+isolated check --- 500 frames near a score of $1$, then a sustained fault near
+$100$ --- the detector returned to normal at fault frame $251$, about two
+minutes of audio, and never alerted again. From one microphone's score, a
+legitimate change of operating point and a fault that has stopped worsening are
+indistinguishable, so the detector no longer guesses: flagged frames are
+excluded from the baseline, a drift guard compares the recent median against an
+anchor frozen at the end of warmup so that a fault creeping in below the
+per-frame threshold is also caught, and accepting a change as the new normal is
+an explicit, logged operator command. On a synthetic ramp whose every step is
+sub-threshold, the rolling baseline alone absorbed the whole ramp; with the
+guard, every frame of the final $500$ is flagged.
+
+\textbf{A pAUC comparison across scales.} Developed in
+Section~\ref{sec:dcase}. The previous version reported a $0.337$ shortfall at
+low false-alarm rates; on a common scale the detector is roughly level there.
+
+\textbf{An array split across workers.} Windows were keyed by microphone, each
+worker assembled snapshots in its own process, and the worker had a lag-driven
+autoscaler. With more than one partition, a second worker receives some of an
+array's microphones and the first the rest; neither can complete a snapshot, so
+both wait out the degraded-release timeout, throughput collapses, lag rises, and
+the autoscaler adds workers. Windows and spatial snapshots are now keyed by
+array, the worker autoscaler is removed, and the manifests state that one array
+is one consumer.
+
 \section{Data and Simulation}
 \label{sec:data}
 
@@ -395,6 +473,13 @@ $g_n$ inverse-square attenuation from the source microphone, and $\phi_b$ a
 Gaussian envelope over mel bins. The spatial term is what gives the graph
 convolution something to learn: a fault at node $0$ is loudest at node $0$ and
 attenuates with distance.
+
+Labels are per microphone, matching what the system serves. The source
+microphone is labelled $s$; every other microphone receives a healthy draw from
+$U(0, 0.1)$, because the machine \emph{it} monitors is healthy even though it
+hears the fault attenuated. Distinguishing the two is the spatial model's job.
+The label is a severity, not a time: I call the model's output a
+\emph{degradation score} for that reason.
 
 \subsection{The defect}
 
@@ -452,15 +537,18 @@ call --- which is what makes the spatial convolution time-resolved, and is the
 dominant training cost. Readout produces both a pooled graph embedding and
 per-node embeddings ($0.31$\,M parameters).
 
-\textbf{Liquid network.} A CfC integrates the per-node embedding sequence over
-the measured inter-frame intervals ($0.05$\,M parameters). The sequence form is
+\textbf{Liquid network.} A CfC integrates each microphone's embedding sequence
+over the measured inter-frame intervals and emits that microphone's degradation
+score ($0.05$\,M parameters). Training, calibration, and inference share one
+function for this, so the model is fitted on exactly what it serves. The sequence form is
 essential and was the subject of an earlier defect: feeding a single pooled
 vector repeated across time gives a continuous-time model a constant signal and
 discards the entire justification for the architecture.
 
 \textbf{Anomaly scoring.} A convolutional autoencoder reconstructs single frames;
 per-node reconstruction error is converted to a robust $z$-score against that
-node's rolling median and MAD. Group normalisation rather than batch
+node's rolling median and MAD, with a drift guard against a frozen post-warmup
+anchor (Section~\ref{sec:review}). Group normalisation rather than batch
 normalisation, because the worker scores one frame at a time.
 
 \textbf{Grounded diagnosis.} For flagged frames the per-bin reconstruction error
@@ -475,9 +563,9 @@ ground than a narrow one.
 \section{Uncertainty Quantification}
 \label{sec:conformal}
 
-The forecaster emits a sigmoid. Nothing in the training objective makes $0.7$
-mean ``fails 70\% of the time'', and that is the number a maintenance planner
-would schedule an outage against. Split conformal prediction converts it to an
+The forecaster emits a sigmoid regressed onto severity. Nothing in the training
+objective makes $0.7$ mean ``fails 70\% of the time'', yet a bare point estimate
+is the number a maintenance planner would schedule an outage against. Split conformal prediction converts it to an
 interval with finite-sample marginal coverage without assumptions on the model
 or error distribution: hold out a calibration set, measure realised residuals,
 take a quantile.
@@ -488,6 +576,13 @@ critical forecasts is poor --- and critical forecasts are the only ones anyone
 acts on. Mondrian conformal calibrates within strata, requiring
 \texttt{min\_group\_size} samples per stratum before a group receives its own
 radius.
+
+Calibration must also use the quantity that is served. The worker attaches
+intervals to per-microphone scores, so calibration runs on per-microphone
+forecasts, split by sequence before flattening so that no acoustic instant
+contributes to both halves. Microphones within one sequence are correlated;
+realised coverage is therefore measured on the held-out half rather than
+assumed.
 
 Two compounding defects prevented this from working. The label gap starved the
 middle band, and the calibration set --- half of a $15\%$ test split --- was
@@ -512,29 +607,37 @@ neither the model nor the calibrator has seen.
 \subsection{Effect of the correction}
 
 Run A is the original configuration. Run B closes the label gap and raises $N$.
-Run C additionally enlarges the calibration split.
+Run C additionally enlarges the calibration split. Runs A--C train, evaluate,
+and calibrate on the pooled graph readout, one score per sequence. Run D is the
+correction from Section~\ref{sec:review}: per-microphone labels, training,
+evaluation, and calibration, on the same path the worker serves. Its metrics
+are over microphones rather than sequences, so it has four times the samples.
 
 \begin{center}
-\begin{tabular}{lccc}
+\begin{tabular}{lcccc}
 \toprule
-& \textbf{A} (original) & \textbf{B} (gap closed) & \textbf{C} (final) \\
+& \textbf{A} (original) & \textbf{B} (gap closed) & \textbf{C} (pooled) & \textbf{D} (served) \\
 \midrule
-Sequences $N$              & 1000   & 4000   & 4000   \\
-Train/val/test             & 70/15/15 & 70/15/15 & 65/15/20 \\
+Sequences $N$              & 1000   & 4000   & 4000   & 4000 \\
+Train/val/test             & 70/15/15 & 70/15/15 & 65/15/20 & 65/15/20 \\
+Unit of evaluation         & sequence & sequence & sequence & microphone \\
 \midrule
-$\mathrm{F}_1$             & 1.0000 & 0.9712 & 0.9672 \\
-Precision                  & 1.0000 & 0.9593 & 0.9529 \\
-Recall                     & 1.0000 & 0.9833 & 0.9818 \\
-MAE                        & 0.0608 & 0.0375 & 0.0313 \\
-Baseline MAE               & 0.3255 & 0.2433 & 0.2450 \\
+$\mathrm{F}_1$             & 1.0000 & 0.9712 & 0.9672 & 0.9714 \\
+Precision                  & 1.0000 & 0.9593 & 0.9529 & 0.9623 \\
+Recall                     & 1.0000 & 0.9833 & 0.9818 & 0.9808 \\
+MAE                        & 0.0608 & 0.0375 & 0.0313 & 0.0260 \\
+Baseline MAE               & 0.3255 & 0.2433 & 0.2450 & 0.0808 \\
 \midrule
-Coverage (nominal $0.90$)  & 0.933  & 0.890  & 0.890  \\
-Mean interval width        & 0.190  & 0.141  & 0.119  \\
-Calibration $n$            & 75     & 300    & 400    \\
-Strata with own radius     & 1 / 3  & 2 / 3  & \textbf{3 / 3} \\
+Coverage (nominal $0.90$)  & 0.933  & 0.890  & 0.890  & 0.890 \\
+Mean interval width        & 0.190  & 0.141  & 0.119  & 0.092 \\
+Calibration $n$            & 75     & 300    & 400    & 1600 \\
+Strata with own radius     & 1 / 3  & 2 / 3  & 3 / 3  & \textbf{3 / 3} \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+Run D is the figure to quote for the system as deployed. Runs A--C measured a
+facility-level quantity that the worker never served.
 
 \subsubsection{Interpretation}
 
@@ -558,20 +661,30 @@ Coverage moves from $0.933$ to $0.890$ against a nominal $0.900$. Run A was
 were wider than the data required, and width is the cost an operator pays.
 Run C is within one point of nominal with intervals $37\%$ narrower.
 
+Run D's MAE should not be read as a better model. Per microphone, about nine
+labels in ten are healthy, because a fault sits at one of four microphones, so
+the mean predictor is far stronger ($0.0808$ against $0.2450$) and the model's
+margin over it shrinks from $7.8\times$ to $3.1\times$. The per-microphone task
+is also harder: the model must say \emph{which} machine is failing, not just
+whether any is. That is the question an operator is asking, and Run D is the
+first run to measure it.
+
 \subsection{Group-conditional calibration}
 
-The fitted radii in Run C:
+The fitted radii in Runs C and D:
 
 \begin{center}
-\begin{tabular}{lrr}
+\begin{tabular}{lrrrr}
 \toprule
-Stratum & Calibration $n$ & Radius \\
+& \multicolumn{2}{c}{\textbf{C} (pooled)} & \multicolumn{2}{c}{\textbf{D} (served)} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Stratum & $n$ & Radius & $n$ & Radius \\
 \midrule
-normal   & 293 & 0.0478 \\
-warning  &  44 & 0.0741 \\
-critical &  63 & 0.1054 \\
+normal   & 293 & 0.0478 & 1496 & 0.0452 \\
+warning  &  44 & 0.0741 &   46 & 0.0505 \\
+critical &  63 & 0.1054 &   58 & 0.0696 \\
 \midrule
-global   & 400 & 0.0513 \\
+global   & 400 & 0.0513 & 1600 & 0.0456 \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -585,6 +698,13 @@ of $0.051$, roughly half the $0.105$ that critical forecasts actually require.
 Under the original configuration, intervals on the most consequential
 predictions were approximately twice too narrow, and the marginal coverage
 figure of $0.933$ concealed it.
+
+Run D keeps the ordering, and its radii are the ones the worker actually
+attaches to per-microphone scores. Before the correction, the served intervals
+used Run C's radii: fitted to pooled forecasts, applied to per-node ones, with no
+coverage guarantee for the numbers shipped. The high-risk strata in Run D remain
+small ($46$ and $58$), because only one microphone in four carries a fault;
+their radii are estimable but not tightly.
 
 \subsection{An intermediate hypothesis that was wrong}
 
@@ -621,27 +741,61 @@ ST-GNN and the liquid network are not exercised at all. What this measures is
 the autoencoder and the robust scorer, which is the component the DCASE baseline
 is also built from and therefore the only one that can be compared.
 
+Partial AUC needs a note before the numbers, because it is reported on two
+scales and an earlier version of this section compared across them. Both are
+affine maps of the same raw area $A$ under the ROC curve over
+$\mathrm{FPR} \in [0, p]$. Murmur's harness reports $A/p$, the mean recall over
+that strip, on which chance scores $p/2 = 0.05$. The official DCASE evaluator
+calls \texttt{sklearn.metrics.roc\_auc\_score(max\_fpr=p)}, which returns the
+McClish standardisation
+\[
+\mathrm{pAUC}_{\mathrm{std}} \;=\; \tfrac{1}{2}\left(1 +
+\frac{A - p^2/2}{p - p^2/2}\right),
+\]
+on which chance scores $0.5$. Every published DCASE baseline figure, including
+the $0.5999$ used here, is on the standardised scale. Because both are affine in
+$A$ the conversion is exact, and the harness now reports both; only the
+standardised column is compared with the baseline.
+
 \begin{center}
-\begin{tabular}{lrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
-Unit & AUC & pAUC@10\% & AP & Baseline AUC \\
+& & \multicolumn{2}{c}{pAUC@10\% (std)} & pAUC@10\% & \\
+\cmidrule(lr){3-4}
+Unit & AUC & Murmur & Baseline & (recall) & AP \\
 \midrule
-pump/id\_00 & 0.7324 & 0.3483 & 0.8230 & 0.7289 \\
-pump/id\_02 & 0.6175 & 0.2865 & 0.7138 & 0.7289 \\
-pump/id\_04 & 0.7690 & 0.3220 & 0.7830 & 0.7289 \\
-pump/id\_06 & 0.5729 & 0.0961 & 0.5817 & 0.7289 \\
+pump/id\_00 & 0.7324 & 0.6570 & 0.5999 & 0.3483 & 0.8230 \\
+pump/id\_02 & 0.6175 & 0.6245 & 0.5999 & 0.2865 & 0.7138 \\
+pump/id\_04 & 0.7690 & 0.6432 & 0.5999 & 0.3220 & 0.7830 \\
+pump/id\_06 & 0.5729 & 0.5243 & 0.5999 & 0.0961 & 0.5817 \\
 \midrule
-\textbf{Mean} & \textbf{0.6730} & \textbf{0.2632} & 0.7254 & 0.7289 \\
+\textbf{Mean} & \textbf{0.6730} & \textbf{0.6122} & 0.5999 & 0.2632 & 0.7254 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
+\noindent Baseline AUC is $0.7289$ for every row (the pump aggregate).
+
 Mean AUC of $0.6730$ sits $0.0559$ below the published DCASE 2020 autoencoder
-baseline of $0.7289$. Mean pAUC at $p{=}0.1$ is $0.2632$ against a baseline of
-$0.5999$, a shortfall of $0.337$ --- and pAUC is the metric that matters
-operationally, because it integrates only over the low-false-positive region
-where a plant would actually set its threshold. A system that fires on ten
-percent of healthy pumps has already been muted by its operators.
+baseline of $0.7289$. On the scale the baseline is reported on, mean pAUC at
+$p{=}0.1$ is $0.6122$ against $0.5999$ --- level with it, $0.0123$ above. Three
+units sit above the pump aggregate and id\_06 below it ($0.5243$), though
+per-unit rows are not strictly like-for-like (see the caveats below).
+
+This corrects what the previous version of this paper said. It set the
+mean-recall figure of $0.2632$ against the baseline's standardised $0.5999$,
+reported a shortfall of $0.337$, and concluded that the detector was furthest
+behind in exactly the low-false-alarm regime that matters. The detector's scores
+were right: the harness reproduces every figure above to four decimals. The
+comparison was across scales. It was caught in external review, and it is the
+same class of error Section~\ref{sec:data} is about --- a correctly computed
+number read as measuring something it did not.
+
+Read together, the two metrics say the detector trails the baseline across the
+whole ROC curve and is roughly level with it at the low-false-positive end,
+where a plant would actually set its threshold. That is a weaker result than a
+win and a far stronger one than the shortfall previously reported. At one seed
+on four units, the pAUC difference is not distinguishable from parity.
 
 \subsubsection{A benchmark defect found only by executing it}
 
@@ -670,12 +824,11 @@ Correcting the extractor to import the production transform, matching
 
 Two things deserve emphasis. First, per-unit AUC spans $0.5729$ to $0.7690$;
 reporting id\_04 alone would have suggested the system beats the baseline by
-four points, and reporting id\_06 alone that it loses by sixteen. Second, and
-more importantly, the same detector scores $\mathrm{F}_1 = 0.9672$ on the
-corrected simulator. The simulator was made harder in Section~\ref{sec:data}
-and remains far easier than a real pump. A generator is a statement of its
-author's assumptions, and this is the measurement of how much those
-assumptions were worth.
+four points, and reporting id\_06 alone that it loses by sixteen. Second, the
+synthetic figures in Section~\ref{sec:experiments} are not comparable with these
+at all: they measure the forecaster on a generator, while this measures the
+anomaly detector on recorded audio. The simulator was made harder in
+Section~\ref{sec:data} and remains far easier than a real pump.
 
 The comparison carries two caveats. The baseline figures are transcribed from
 the DCASE 2020 results and should be verified against the official page before
@@ -717,14 +870,14 @@ so it could only pass when the tolerance was wide enough to be meaningless.
 
 \subsection{Verification}
 
-452 tests, executing in roughly 25 seconds. Every audit finding has a regression
+515 tests, executing in about a minute. Every audit and review finding has a regression
 test, because all eleven were invisible to the suite that existed. Kafka
 integration is verified against a real broker rather than skipped: the readiness
 probe performs the same metadata round trip the test fixture does, so passing it
 means the test genuinely runs.
 
 Infrastructure is validated against the tooling that consumes it rather than by
-inspection --- manifests through \texttt{kubeconform} ($14$ resources, $0$
+inspection --- manifests through \texttt{kubeconform} ($13$ resources, $0$
 invalid), the container image pulled and its user, healthcheck path, and default
 log directory confirmed directly, and the package layout checked by reproducing
 the Dockerfile's copy set in isolation.
@@ -767,6 +920,16 @@ cooldown, so a signal oscillating between warning and critical will re-page on
 each upward transition; this is defensible but untested against real fault
 progressions.
 
+The anomaly detector cannot tell a legitimate change of operating point from a
+fault that has stopped worsening, and does not try: both stay flagged until an
+operator re-baselines the node. That makes a correct step change a recurring
+page until someone acts, and it moves a judgement from the model to a person by
+design. Baselines are held in worker memory, so a restart during a fault
+re-learns the fault as normal during warmup; persisting them is future work.
+Finally, one worker consumes one microphone array. That is a property of the
+problem --- a snapshot needs every microphone --- rather than of the
+implementation, but it bounds per-array throughput by one GPU.
+
 \section{Conclusion}
 
 I audited a spatio-temporal acoustic monitoring system built concurrently by
@@ -779,20 +942,21 @@ $0.9672$ and, together with an enlarged calibration split, restored
 group-conditional conformal coverage across all three severity strata for the
 first time --- revealing that intervals on critical forecasts had been
 approximately twice too narrow, concealed behind an apparently healthy marginal
-coverage figure.
+coverage figure. An external review then showed that those figures described a
+pooled quantity the system never served. Measured on the served per-microphone
+path, $\mathrm{F}_1$ is $0.9714$ at the same nominal coverage.
 
 On recorded pump audio the corrected detector reaches a mean AUC of $0.6730$
-against a published baseline of $0.7289$, and a mean pAUC of $0.2632$ against
-$0.5999$. It does not beat a standard autoencoder baseline, and it is furthest
-behind in the low-false-alarm regime that determines whether an alerting system
-survives contact with the people it pages. I regard obtaining that number as the
-more valuable outcome than the number itself: the gap between $0.9672$ on the
-simulator and $0.67$ on real audio is the quantity the earlier reported
-$\mathrm{F}_1 = 1.000$ was concealing, and it is now measured rather than
-assumed --- and even that $0.67$ was, until it was actually executed rather
-than read, a measurement of a benchmark's own \texttt{log1p} substitute for the
-production feature transform, not of the system in
-Section~\ref{sec:dcase}.
+against a published baseline of $0.7289$, and a mean standardised pAUC of
+$0.6122$ against $0.5999$. It trails a standard autoencoder baseline across the
+full curve and is roughly level with it at low false-alarm rates, the regime
+that determines whether an alerting system survives contact with the people it
+pages. The previous version of this paper reported a large shortfall in that
+regime, from a comparison across two pAUC scales; before that, the benchmark
+had been scoring a feature transform the deployed system does not compute.
+Three times in this work a correctly computed number was read as measuring
+something it did not, and the remedy was the same each time: check what the
+number is defined as, and what it was computed on, before reading what it says.
 
 What this work provides is a pipeline whose claims can be checked: the
 measurement protocol is corrected, the uncertainty quantification does what it
@@ -803,9 +967,9 @@ The obvious next steps follow from the gap. The spatial and temporal components
 are untested on real data, because DCASE is single-channel and no public corpus
 provides a synchronised industrial microphone array; producing one, or
 evaluating on MIMII's multi-channel recordings, would exercise the parts of the
-architecture the pump result leaves entirely unmeasured. And the pAUC shortfall
-is the concrete target: a detector at $0.26$ where the baseline reaches $0.60$
-has a specific, measurable deficiency in the only operating region that
-matters.
+architecture the pump result leaves entirely unmeasured. The pump result needs
+more seeds and the other DCASE machine types before any pAUC difference can be
+called real; the full-curve AUC gap and the weakest unit (id\_06: AUC $0.5729$,
+standardised pAUC $0.5243$) are the concrete targets for the detector.
 
 \end{document}

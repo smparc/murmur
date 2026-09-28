@@ -16,7 +16,7 @@ def _valid_payload(**overrides) -> dict:
         "gnn_embedding": [0.01] * settings.GNN_EMBEDDING_DIM,
         "anomaly_score": 0.5,
         "anomaly_severity": "warning",
-        "ttf_prediction": 0.4,
+        "degradation_score": 0.4,
         "is_anomaly": True,
         "z_score": 3.2,
     }
@@ -81,7 +81,7 @@ class TestGeneration:
         assert isinstance(body["telemetry"], str) and body["telemetry"]
         assert body["anomaly"]["severity"] == "warning"
         assert body["anomaly"]["is_anomaly"] is True
-        assert 0.0 <= body["ttf_prediction"] <= 1.0
+        assert 0.0 <= body["degradation_score"] <= 1.0
 
     def test_severity_is_structured_not_parsed_from_text(self, api_client):
         """The dashboard must never need to regex the generated prose."""
@@ -174,7 +174,7 @@ class TestWebSocket:
             api_client.post("/generate_telemetry", json=_valid_payload(node_id=2))
             frame = ws.receive_json()
             assert frame["node_id"] == 2
-            assert "anomaly" in frame and "ttf_prediction" in frame
+            assert "anomaly" in frame and "degradation_score" in frame
 
     def test_new_client_receives_replay_history(self, api_client):
         """An operator opening the dashboard mid-shift should see context."""
@@ -219,8 +219,8 @@ class TestAuth:
 
     def test_metrics_requires_a_key(self, secured_client):
         """
-        The exposition carries per-node anomaly counts, z-scores and TTF
-        forecasts — a live map of which machines are failing. On a LoadBalancer
+        The exposition carries per-node anomaly counts, z-scores and degradation
+        scores — a live map of which machines are failing. On a LoadBalancer
         Service that was public whenever an API key was configured.
         """
         assert secured_client.get("/metrics").status_code == 401
@@ -230,6 +230,57 @@ class TestAuth:
         """A Prometheus that cannot present a key needs an escape hatch."""
         override_settings(METRICS_REQUIRE_AUTH=False)
         assert secured_client.get("/metrics").status_code == 200
+
+
+class TestDashboardKey:
+    """
+    The dashboard's key ships in its JavaScript bundle, so it is readable by
+    anyone who can load the page. It previously *was* the write key: reading it
+    out of the bundle was enough to post fabricated telemetry and anomalies.
+    """
+
+    @pytest.fixture
+    def split_client(self, override_settings):
+        from fastapi.testclient import TestClient
+
+        override_settings(API_KEY="write-key", DASHBOARD_API_KEY="read-key")
+        from src.translation.llm_decoder import app
+
+        with TestClient(app) as client:
+            yield client
+
+    def test_dashboard_key_opens_the_live_feed(self, split_client):
+        with split_client.websocket_connect("/ws/telemetry?api_key=read-key"):
+            pass
+
+    def test_write_key_also_opens_the_live_feed(self, split_client):
+        with split_client.websocket_connect("/ws/telemetry?api_key=write-key"):
+            pass
+
+    def test_feed_rejects_a_wrong_key(self, split_client):
+        from starlette.websockets import WebSocketDisconnect
+
+        with (
+            pytest.raises(WebSocketDisconnect),
+            split_client.websocket_connect("/ws/telemetry?api_key=nope") as ws,
+        ):
+            ws.receive_json()
+
+    def test_dashboard_key_cannot_submit_telemetry(self, split_client):
+        response = split_client.post(
+            "/generate_telemetry", json=_valid_payload(), headers={"X-API-Key": "read-key"}
+        )
+        assert response.status_code == 401
+
+    def test_dashboard_key_cannot_read_metrics(self, split_client):
+        """/metrics is a per-machine failure map; a public key must not open it."""
+        assert split_client.get("/metrics", headers={"X-API-Key": "read-key"}).status_code == 401
+
+    def test_write_key_still_submits(self, split_client):
+        response = split_client.post(
+            "/generate_telemetry", json=_valid_payload(), headers={"X-API-Key": "write-key"}
+        )
+        assert response.status_code == 200
 
 
 class TestRateLimit:

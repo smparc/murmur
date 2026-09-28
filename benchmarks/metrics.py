@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 # be all-normal, so a degenerate split reports chance instead of raising.
 from src.evaluation.metrics import partial_auc as _core_partial_auc
 from src.evaluation.metrics import roc_auc as _core_roc_auc
+from src.evaluation.metrics import to_standardized_pauc
 
 __all__ = [
     "DetectionMetrics",
@@ -43,6 +44,7 @@ __all__ = [
     "lead_time",
     "partial_roc_auc",
     "roc_auc",
+    "standardized_partial_roc_auc",
     "summarize",
 ]
 
@@ -74,12 +76,16 @@ def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> float:
 
 def partial_roc_auc(scores: Sequence[float], labels: Sequence[int], max_fpr: float = 0.1) -> float:
     """
-    ROC AUC restricted to ``fpr <= max_fpr``, normalised back to ``[0, 1]``.
+    ROC AUC restricted to ``fpr <= max_fpr``, as mean recall over that strip.
 
-    This is the DCASE anomalous-sound-detection headline metric, and it is the
-    honest one for maintenance: the only region of the ROC curve a plant will
-    ever operate in is the low-false-positive end. A model can buy a strong full
-    AUC with behaviour at 60% FPR that nobody would ever deploy.
+    The low-false-positive end is the honest region for maintenance: it is the
+    only part of the ROC curve a plant will ever operate in. A model can buy a
+    strong full AUC with behaviour at 60% FPR that nobody would ever deploy.
+
+    **Not the DCASE scale.** DCASE reports the McClish-standardised value (chance
+    = 0.5); this returns area / ``max_fpr`` (chance = ``max_fpr / 2``). Use
+    :func:`standardized_partial_roc_auc` for any comparison with a published
+    baseline â€” see :mod:`src.evaluation.metrics`.
 
     A degenerate split reports chance for the strip (``max_fpr / 2``), matching
     :func:`roc_auc`'s reason for not raising.
@@ -91,6 +97,17 @@ def partial_roc_auc(scores: Sequence[float], labels: Sequence[int], max_fpr: flo
     if not _has_both_classes(labels):
         return max_fpr / 2.0
     return _core_partial_auc(scores, labels, max_fpr)
+
+
+def standardized_partial_roc_auc(
+    scores: Sequence[float], labels: Sequence[int], max_fpr: float = 0.1
+) -> float:
+    """
+    McClish-standardised partial AUC: the scale DCASE baselines are published on.
+
+    A degenerate split reports chance, which on this scale is 0.5.
+    """
+    return to_standardized_pauc(partial_roc_auc(scores, labels, max_fpr), max_fpr)
 
 
 def average_precision(scores: Sequence[float], labels: Sequence[int]) -> float:
@@ -360,6 +377,7 @@ def summarize(
     summary: dict[str, float] = {
         "roc_auc": roc_auc(scores, labels),
         "pauc_10": partial_roc_auc(scores, labels, max_fpr=0.1),
+        "pauc_10_standardized": standardized_partial_roc_auc(scores, labels, max_fpr=0.1),
         "average_precision": average_precision(scores, labels),
         "false_alarms_per_hour": false_alarm_rate_per_hour(predictions, labels, frame_interval_s),
         "frames": len(scores),
