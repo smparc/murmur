@@ -1,11 +1,11 @@
 """
-Distribution-free prediction intervals for the Time-to-Failure forecast.
+Distribution-free prediction intervals for the degradation score.
 
-The Liquid Network emits a sigmoid — a number in [0, 1] that looks like a
-probability but is not calibrated to be one. Nothing in the training objective
-forces 0.7 to mean "fails 70% of the time". A maintenance planner cannot act on
-that: scheduling an outage is expensive, and the question is not "what is the
-score" but "how wrong could this be".
+The Liquid Network emits a sigmoid regressed onto fault severity — a number in
+[0, 1] that looks like a probability but is not one. Nothing in the training
+objective forces 0.7 to mean "fails 70% of the time". A maintenance planner
+cannot act on a bare point estimate: scheduling an outage is expensive, and the
+question is not "what is the score" but "how wrong could this be".
 
 Split conformal prediction answers exactly that, and does so without assuming
 anything about the model, the noise distribution, or the data-generating
@@ -16,7 +16,10 @@ exchangeable data, the true value falls inside at least ``1 - alpha`` of the
 time. No asymptotics, no Gaussian assumption, no retraining.
 
 The one thing it does assume is exchangeability between calibration and
-production data. Acoustic drift breaks that, which is precisely what the Dagster
+production data. That includes the *serving path*: calibrating on one quantity
+and attaching the radius to another voids the guarantee outright, which is why
+training calibrates on the same per-node forecasts the worker ships. Acoustic
+drift breaks exchangeability too, which is precisely what the Dagster
 drift monitor exists to catch — a coverage collapse on live data is the signal
 that the calibration is stale, and is far more actionable than a moved MAE.
 
@@ -36,7 +39,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-# TTF is a probability; intervals are clipped to it.
+# The degradation score lives in [0, 1]; intervals are clipped to it.
 _LOWER_BOUND = 0.0
 _UPPER_BOUND = 1.0
 

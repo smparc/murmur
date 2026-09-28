@@ -17,6 +17,29 @@ Two cooperating pieces:
 The scorer uses a median/MAD robust z-score rather than mean/std. That matters
 here: a developing fault contaminates the very statistics used to detect it, and
 the mean is far more easily dragged along by the anomaly than the median is.
+
+Persistent faults and the "new normal"
+--------------------------------------
+From one microphone's scalar score alone, a legitimate change of operating point
+and a fault that has stopped getting worse are indistinguishable. Any purely
+self-referencing baseline must therefore either learn persistent faults as
+normal or never learn legitimate changes. The scorer takes the second side,
+deliberately, and makes the first an explicit human decision:
+
+- **Flagged frames are not admitted to the rolling baseline.** Admitting them
+  let a sustained fault take over the median: with a 500-frame window a step
+  fault was flagged for 250 frames, then read as normal from frame 251 onward —
+  about two minutes at 0.5 s chunks, after which it never alerted again.
+- **A drift guard catches what the rolling baseline cannot.** Sub-threshold
+  frames are still admitted, so slow legitimate drift is tracked, but so is a
+  fault that creeps in below the per-frame threshold. The median of recent raw
+  scores is therefore also compared against an *anchor* frozen when warmup
+  completes; a sustained departure from the anchor flags even when no single
+  frame does.
+- **Re-baselining is explicit.** When an engineer confirms a change is a new
+  normal, :meth:`AnomalyScorer.rebaseline` (reached in production through the
+  ``murmur-rebaseline`` command) adopts recent audio as the new baseline and
+  anchor. Time alone never does.
 """
 
 from __future__ import annotations
@@ -143,6 +166,14 @@ class ScoreResult:
     is_warmup: bool
     severity: Severity
     baseline_median: float
+    # Robust z of the recent median against the post-warmup anchor. Non-zero
+    # only once the drift guard is armed; see the module docstring.
+    drift_z: float = 0.0
+
+    @property
+    def effective_z(self) -> float:
+        """The larger of the per-frame and drift departures — what flagged, if anything."""
+        return max(self.z_score, self.drift_z)
 
     @property
     def normalized_score(self) -> float:
@@ -150,19 +181,28 @@ class ScoreResult:
         Robust z mapped into ``[0, 1]`` for transport over the API and for
         display. Saturating rather than clipping keeps large excursions ordered
         instead of flattening everything severe to exactly 1.0.
+
+        Uses :attr:`effective_z`, so a frame flagged by the drift guard does not
+        read as a near-zero anomaly score.
         """
-        if self.z_score <= 0.0:
+        if self.effective_z <= 0.0:
             return 0.0
-        return float(1.0 - math.exp(-self.z_score / 6.0))
+        return float(1.0 - math.exp(-self.effective_z / 6.0))
 
 
 class _NodeState:
-    """Rolling baseline for a single microphone."""
+    """Rolling baseline, drift anchor and recent history for a single microphone."""
 
-    __slots__ = ("anomaly_frames", "scores", "total_frames")
+    __slots__ = ("anchor", "anomaly_frames", "recent", "scores", "total_frames")
 
-    def __init__(self, window: int):
+    def __init__(self, window: int, drift_window: int):
         self.scores: deque[float] = deque(maxlen=window)
+        # Every raw score, flagged or not: the drift guard needs to see the
+        # fault it is looking for, which the rolling baseline no longer admits.
+        self.recent: deque[float] = deque(maxlen=drift_window)
+        # Frozen copy of the baseline at the end of warmup (or at the last
+        # explicit re-baseline). Never updated by the passage of time.
+        self.anchor: list[float] | None = None
         self.total_frames: int = 0
         self.anomaly_frames: int = 0
 
@@ -194,6 +234,14 @@ class AnomalyScorer:
         Robust-z above which a frame is flagged. Twice this is "critical".
     window:
         Length of the rolling baseline, in frames.
+    drift_guard:
+        Compare the recent median against the post-warmup anchor, so a fault
+        that creeps in below the per-frame threshold is still caught.
+    drift_window:
+        Frames in that recent median. Defaults to ``warmup_frames``. Longer is
+        steadier but slower to fire; a median over 50 frames has roughly a fifth
+        of a single frame's spread, so only a genuine level shift reaches the
+        threshold.
     """
 
     def __init__(
@@ -204,22 +252,32 @@ class AnomalyScorer:
         z_threshold: float = 3.0,
         window: int = 500,
         device: torch.device | str = "cpu",
+        drift_guard: bool = True,
+        drift_window: int | None = None,
     ):
         if warmup_frames < 1:
             raise ValueError("warmup_frames must be >= 1")
         if window < warmup_frames:
             raise ValueError("window must be >= warmup_frames")
+        drift_window = warmup_frames if drift_window is None else drift_window
+        if drift_window < 1:
+            raise ValueError("drift_window must be >= 1")
 
         self.autoencoder = autoencoder
         self.warmup_frames = warmup_frames
         self.z_threshold = z_threshold
         self.window = window
+        self.drift_guard = drift_guard
+        self.drift_window = drift_window
         self.device = torch.device(device)
 
         if self.autoencoder is not None:
             self.autoencoder.to(self.device).eval()
 
-        self._nodes: dict[int, _NodeState] = {i: _NodeState(window) for i in range(num_nodes)}
+        self._nodes: dict[int, _NodeState] = {i: self._new_state() for i in range(num_nodes)}
+
+    def _new_state(self) -> _NodeState:
+        return _NodeState(self.window, self.drift_window)
 
     # -- internals ----------------------------------------------------------
 
@@ -227,7 +285,7 @@ class AnomalyScorer:
         state = self._nodes.get(node_id)
         if state is None:
             # A microphone we were not told about came online.
-            state = _NodeState(self.window)
+            state = self._new_state()
             self._nodes[node_id] = state
         return state
 
@@ -255,7 +313,7 @@ class AnomalyScorer:
         ordered = sorted(history)
         n = len(ordered)
         mid = n // 2
-        median = ordered[mid] if n % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])
+        median = _median(ordered)
 
         deviations = sorted(abs(s - median) for s in ordered)
         mad = deviations[mid] if n % 2 else 0.5 * (deviations[mid - 1] + deviations[mid])
@@ -306,16 +364,28 @@ class AnomalyScorer:
         else:
             z, median = self._robust_z(raw, state.scores)
 
-        is_anomaly = (not is_warmup) and z >= self.z_threshold
-        severity = self._severity(z) if not is_warmup else "normal"
+        state.recent.append(raw)
+        drift_z = 0.0
+        if self.drift_guard and not is_warmup and state.anchor:
+            drift_z, _ = self._robust_z(_median(sorted(state.recent)), state.anchor)
+
+        effective_z = max(z, drift_z)
+        is_anomaly = (not is_warmup) and effective_z >= self.z_threshold
+        severity = self._severity(effective_z) if not is_warmup else "normal"
 
         if is_anomaly:
             state.anomaly_frames += 1
+        else:
+            # Only frames the scorer accepts as normal shape the baseline. When
+            # flagged frames were admitted too, a sustained fault displaced the
+            # median once it filled half the window and was read as normal from
+            # then on — the fault became the baseline. Excluding them means a
+            # step change stays flagged until someone decides it is a new normal
+            # and calls `rebaseline`; see the module docstring.
+            state.scores.append(raw)
 
-        # Anomalous frames are still admitted to the baseline. Excluding them
-        # would freeze the window during a sustained fault and make a new
-        # steady state permanently anomalous; the median keeps them in check.
-        state.scores.append(raw)
+        if state.total_frames == self.warmup_frames:
+            state.anchor = list(state.scores)
 
         return ScoreResult(
             node_id=node_id,
@@ -325,7 +395,33 @@ class AnomalyScorer:
             is_warmup=bool(is_warmup),
             severity=severity,
             baseline_median=float(median),
+            drift_z=float(drift_z),
         )
+
+    def rebaseline(self, node_id: int) -> bool:
+        """
+        Accept a node's current sound as its new normal.
+
+        Adopts the recent raw scores — flagged ones included, which is the point
+        — as both the rolling baseline and the drift anchor, so detection resumes
+        immediately against the new operating point instead of going blind for a
+        warmup. Returns False, and falls back to a full reset and warmup, when
+        there is not yet enough recent history to form a baseline from.
+
+        This is the only way a persistent departure stops being flagged. It is
+        an engineering judgement ("the pump was re-rated", "that is the new
+        bearing"), so it is exposed to operators rather than decided by a timer.
+        """
+        state = self._state(node_id)
+        recent = list(state.recent)
+        if len(recent) < self.warmup_frames:
+            self.reset(node_id)
+            return False
+
+        state.scores.clear()
+        state.scores.extend(recent)
+        state.anchor = list(recent)
+        return True
 
     def get_node_summary(self) -> dict[int, dict[str, float]]:
         """Per-node counters, for the ``/health`` payload and Dagster checks."""
@@ -338,6 +434,7 @@ class AnomalyScorer:
                 "anomaly_rate": (state.anomaly_frames / total) if total else 0.0,
                 "baseline_samples": len(state.scores),
                 "is_warmed_up": total > self.warmup_frames,
+                "drift_guard_armed": state.anchor is not None,
             }
         return summary
 
@@ -345,4 +442,11 @@ class AnomalyScorer:
         """Clear one node's baseline, or every node's."""
         targets = self._nodes.keys() if node_id is None else [node_id]
         for nid in list(targets):
-            self._nodes[nid] = _NodeState(self.window)
+            self._nodes[nid] = self._new_state()
+
+
+def _median(ordered: list[float]) -> float:
+    """Median of an already-sorted, non-empty list."""
+    n = len(ordered)
+    mid = n // 2
+    return ordered[mid] if n % 2 else 0.5 * (ordered[mid - 1] + ordered[mid])

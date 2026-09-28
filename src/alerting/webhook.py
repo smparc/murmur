@@ -63,7 +63,7 @@ class Alert:
     fault: str
     confidence: float
     anomaly_score: float = 0.0
-    ttf_prediction: float = 0.0
+    degradation_score: float = 0.0
     evidence: tuple[str, ...] = field(default_factory=tuple)
     recommended_action: str = ""
     location: tuple[float, float, float] | None = None
@@ -89,7 +89,7 @@ class Alert:
         lines = [
             f"Node {self.node_id} — {self.fault} ({self.confidence:.0%} confidence)",
             f"Anomaly score {self.anomaly_score:.3f} | "
-            f"Failure probability {self.ttf_prediction:.0%}",
+            f"Degradation score {self.degradation_score:.2f}/1",
         ]
         if self.evidence:
             lines.append("Evidence: " + "; ".join(self.evidence))
@@ -107,7 +107,7 @@ class Alert:
             "fault": self.fault,
             "confidence": round(self.confidence, 4),
             "anomaly_score": round(self.anomaly_score, 4),
-            "ttf_prediction": round(self.ttf_prediction, 4),
+            "degradation_score": round(self.degradation_score, 4),
             "evidence": list(self.evidence),
             "recommended_action": self.recommended_action,
             "location": list(self.location) if self.location else None,

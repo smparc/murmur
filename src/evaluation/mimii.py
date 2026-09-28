@@ -327,6 +327,7 @@ def evaluate(
             per_machine[group] = {
                 "auc": float("nan"),
                 "pauc": float("nan"),
+                "pauc_standardized": float("nan"),
                 "n_normal": int((group_labels == 0).sum()),
                 "n_anomalous": int((group_labels == 1).sum()),
                 "note": "single-class group, ROC undefined",
@@ -343,6 +344,9 @@ def evaluate(
         # contain, which is how DCASE ranks systems.
         "macro_auc": float(np.mean([m["auc"] for m in scored])) if scored else float("nan"),
         "macro_pauc": float(np.mean([m["pauc"] for m in scored])) if scored else float("nan"),
+        "macro_pauc_standardized": (
+            float(np.mean([m["pauc_standardized"] for m in scored])) if scored else float("nan")
+        ),
         "aggregate": aggregate,
         "n_clips": int(labels_arr.size),
     }

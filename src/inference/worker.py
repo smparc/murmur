@@ -11,27 +11,39 @@ Per window::
     windowed spectrograms
         -> assemble all microphones into one graph snapshot
         -> ST-GNN  (per-timestep embedding sequence)
-        -> Liquid Network (TTF forecast over real inter-frame intervals)
+        -> Liquid Network (per-node degradation score over real inter-frame intervals)
         -> AnomalyScorer  (per-node robust z-score)
         -> POST /generate_telemetry
 
-Two design points worth stating:
+Design points worth stating:
 
 - **The graph needs every node at once.** A GCN over a single microphone is
   meaningless, so windows are buffered per node and only released when the
-  whole array has contributed a recent frame.
+  whole array has contributed a recent frame. That makes an array the unit of
+  consumption: windows are keyed by ``ARRAY_ID``, so every window of one array
+  lands on one partition and therefore one worker. Keyed by microphone, a
+  second worker would split the array and neither could ever complete a
+  snapshot.
 - **Detection happens here, not in the API.** The API previously accepted
   ``anomaly_score`` and ``is_anomaly`` from its caller and forwarded them to
   Prometheus, so nothing in the system actually detected anything. Scores are
   computed here from model output.
+- **Telemetry delivery is at-least-once to a record, best-effort to the feed.**
+  The API is the live dashboard feed; alerting does not route through it. A
+  failed submission is retried briefly for transient errors, then written to a
+  dead-letter topic with the reason. Offsets advance only once those writes are
+  acknowledged, so a scored result is never silently lost — but it is also not
+  replayed into the live feed later, where it would be shown as current.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from types import FrameType
 
@@ -51,7 +63,7 @@ from src.alerting.webhook import (
 from src.detection.anomaly_detector import AnomalyScorer, ScoreResult, SpectrogramAutoencoder
 from src.explain.saliency import explain_anomaly
 from src.forecasting.conformal import ConformalCalibrator, severity_bucket
-from src.forecasting.liquid_network import AcousticForecastingLNN
+from src.forecasting.liquid_network import AcousticForecastingLNN, per_node_forecast
 from src.mapping.st_gnn_model import SpatioTemporalGNN
 from src.mapping.tdoa import TDOAEstimate, tdoa_edge_weights
 from src.mapping.topology_graph import build_acoustic_topology
@@ -60,6 +72,7 @@ from src.observability.metrics import (
     NODE_DROPPED,
     PIPELINE_ERRORS,
     SNAPSHOTS_EMITTED,
+    TELEMETRY_DEAD_LETTERED,
     TELEMETRY_DROPPED,
     record_consumer_lag,
     track_inference,
@@ -74,6 +87,15 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CONSUME_BATCH_SIZE = 16
 CONSUME_TIMEOUT_SECONDS = 0.5
+DEAD_LETTER_FLUSH_TIMEOUT_SECONDS = 10.0
+
+# Failure reasons from InferenceWorker.deliver. Only these are worth retrying
+# within a snapshot: the API is momentarily unreachable or erroring. A 429 is the
+# limiter's 60-second window, which a sub-second retry cannot outwait, and any
+# other 4xx is a payload the API will reject however many times it is sent.
+_RETRYABLE = frozenset({"unreachable", "server_error"})
+
+DeadLetterSink = Callable[[dict, str], None]
 
 
 def _build_alert_router() -> AlertRouter:
@@ -111,6 +133,7 @@ class NodeWindow:
     timespans: np.ndarray  # (seq_len,)
     timestamp: float
     latest_frame: np.ndarray  # (n_mels, mel_frames) — for anomaly scoring
+    array_id: str = ""
 
 
 class WindowAssembler:
@@ -299,6 +322,9 @@ def decode_window(raw: bytes) -> NodeWindow | None:
     try:
         payload = msgpack.unpackb(raw, raw=False)
         node_id = int(payload["node_id"])
+        # Absent on windows produced before array keying; those can only have
+        # come from this deployment's own array.
+        array_id = str(payload.get("array_id") or settings.ARRAY_ID)
         timestamp = float(payload["timestamp"])
         shape = tuple(payload["window_shape"])
         window = np.frombuffer(payload["window"], dtype=np.float32).reshape(shape)
@@ -322,6 +348,7 @@ def decode_window(raw: bytes) -> NodeWindow | None:
         timespans=np.ascontiguousarray(timespans),
         timestamp=timestamp,
         latest_frame=np.ascontiguousarray(window[-1]),
+        array_id=array_id,
     )
 
 
@@ -333,9 +360,14 @@ class InferenceWorker:
         inference_url: str | None = None,
         http_client: httpx.Client | None = None,
         load_weights: bool = True,
+        dead_letter: DeadLetterSink | None = None,
     ):
         self.inference_url = (inference_url or settings.INFERENCE_URL).rstrip("/")
         self.num_nodes = settings.NUM_NODES
+        self.array_id = settings.ARRAY_ID
+        # Where payloads the API would not accept are kept. None drops them
+        # (counted), which is only appropriate in tests and local development.
+        self.dead_letter = dead_letter
 
         edge_index, edge_weight = build_acoustic_topology(
             settings.MIC_COORDS,
@@ -384,6 +416,8 @@ class InferenceWorker:
             z_threshold=settings.ANOMALY_Z_THRESHOLD,
             window=settings.ANOMALY_WINDOW,
             device=DEVICE,
+            drift_guard=settings.ANOMALY_DRIFT_GUARD,
+            drift_window=settings.ANOMALY_DRIFT_WINDOW,
         )
 
         self.assembler = WindowAssembler(
@@ -400,7 +434,9 @@ class InferenceWorker:
         self.taxonomy = FaultTaxonomy()
         self.alerts = _build_alert_router()
 
-        self._client = http_client or httpx.Client(timeout=30.0)
+        # Bounded well below max.poll.interval.ms even with retries: a hung API
+        # must not stall the consumer long enough to be evicted from the group.
+        self._client = http_client or httpx.Client(timeout=settings.TELEMETRY_TIMEOUT)
         self._owns_client = http_client is None
         self._throttled = 0
 
@@ -410,13 +446,13 @@ class InferenceWorker:
 
         Absent calibration means forecasts ship as bare point estimates. That is
         a downgrade, not a failure — but it is logged, because an uncalibrated
-        sigmoid presented as a failure probability is exactly the kind of number
+        sigmoid read as a failure probability is exactly the kind of number
         that gets acted on and should not be.
         """
         path = os.path.join(settings.MODEL_DIR, "conformal.json")
         if not os.path.exists(path):
             log.warning(
-                "No conformal calibration at %s — TTF forecasts will carry no "
+                "No conformal calibration at %s — degradation scores will carry no "
                 "uncertainty bounds. Run `murmur-train` to produce one.",
                 path,
             )
@@ -465,6 +501,39 @@ class InferenceWorker:
         )
         self.effective_edge_weight = torch.from_numpy(weights).float().to(DEVICE)
         self.spatial = payload
+
+    # -- operator control ---------------------------------------------------
+
+    def apply_control(self, command: dict) -> bool:
+        """
+        Execute an operator command from the control topic.
+
+        The only command is ``rebaseline``: accept a node's current sound as its
+        new normal. Persistent departures are never absorbed automatically (see
+        ``src/detection/anomaly_detector.py``), so this is how an engineer who
+        has confirmed a legitimate change clears one. Logged at WARNING with who
+        asked and why, because it silences an active detection.
+        """
+        if command.get("command") != "rebaseline":
+            log.warning("Ignoring unknown control command %r", command.get("command"))
+            return False
+        if str(command.get("array_id", self.array_id)) != self.array_id:
+            return False
+
+        node_id = command.get("node_id")
+        targets = range(self.num_nodes) if node_id is None else [int(node_id)]
+        for nid in targets:
+            adopted = self.scorer.rebaseline(nid)
+            log.warning(
+                "Node %s re-baselined by %s (%s): %s",
+                nid,
+                command.get("requested_by", "unknown"),
+                command.get("reason", "no reason given"),
+                "adopted recent audio as the new normal"
+                if adopted
+                else "too little recent history, restarting warmup",
+            )
+        return True
 
     def _load_weights(self) -> bool:
         """Load trained weights; fall back to energy-based scoring if absent."""
@@ -520,8 +589,6 @@ class InferenceWorker:
                 return_nodes=True,
             )
 
-        B, S, N, E = node_sequence.shape
-
         with track_inference("lnn"):
             # One forecast per microphone, from that microphone's own embedding
             # trajectory. Previously a single facility-level TTF was computed
@@ -529,12 +596,14 @@ class InferenceWorker:
             # payload, so the dashboard's per-node cards were identical by
             # construction — an operator reading them as four independent
             # machine forecasts was reading the same number four times.
-            per_node = node_sequence.permute(0, 2, 1, 3).reshape(B * N, S, E)
-            node_timespans = timespans.repeat_interleave(N, dim=0)
-            node_ttf = self.lnn(per_node, timespans=node_timespans).view(B, N)
+            #
+            # Training and conformal calibration go through this same
+            # `per_node_forecast`, so the LNN weights and the interval radii
+            # were fitted on exactly the quantity served here.
+            node_degradation = per_node_forecast(self.lnn, node_sequence, timespans)
 
         node_embeddings = node_sequence.mean(dim=1).squeeze(0).cpu()  # (N, E)
-        ttf_by_node = node_ttf.squeeze(0).cpu().tolist()
+        degradation_by_node = node_degradation.squeeze(0).cpu().tolist()
 
         # A position is attached only when the array geometry supports it.
         #
@@ -557,14 +626,16 @@ class InferenceWorker:
 
             frame = torch.from_numpy(window.latest_frame).float()
             result: ScoreResult = self.scorer.score(node_id, frame)
-            ttf_value = float(ttf_by_node[node_id])
+            degradation = float(degradation_by_node[node_id])
 
-            # A calibrated band around the point forecast. Grouped by severity so
+            # A calibrated band around the point estimate. Grouped by severity so
             # coverage holds within the high-risk stratum rather than only on
             # average across a population dominated by healthy machines.
             interval = None
             if self.calibrator is not None:
-                interval = self.calibrator.interval(ttf_value, severity_bucket(ttf_value)).as_dict()
+                interval = self.calibrator.interval(
+                    degradation, severity_bucket(degradation)
+                ).as_dict()
 
             payload = {
                 "node_id": node_id,
@@ -572,12 +643,13 @@ class InferenceWorker:
                 "gnn_embedding": node_embeddings[node_id].tolist(),
                 "anomaly_score": round(result.normalized_score, 6),
                 "anomaly_severity": result.severity,
-                "ttf_prediction": round(ttf_value, 6),
+                "degradation_score": round(degradation, 6),
                 "is_anomaly": result.is_anomaly,
                 "z_score": round(result.z_score, 4),
+                "drift_z": round(result.drift_z, 4),
             }
             if interval is not None:
-                payload["ttf_interval"] = interval
+                payload["degradation_interval"] = interval
             if source_position is not None:
                 payload["source_position"] = source_position
 
@@ -613,8 +685,31 @@ class InferenceWorker:
             log.warning("Could not attribute anomaly score", exc_info=True)
             return None
 
-    def submit(self, payload: dict) -> bool:
-        """POST one payload to the telemetry API."""
+    def submit(self, payload: dict, retry: bool = True) -> bool:
+        """POST one payload to the telemetry API. True when it was accepted."""
+        return self.deliver(payload, retry=retry) is None
+
+    def deliver(self, payload: dict, retry: bool = True) -> str | None:
+        """
+        POST one payload, retrying transient failures.
+
+        Returns ``None`` on success, otherwise the reason it was not accepted
+        (``unreachable``, ``server_error``, ``throttled`` or ``rejected``). Only
+        ``unreachable`` and ``server_error`` are retried, with exponential
+        backoff, up to ``TELEMETRY_MAX_RETRIES`` times.
+        """
+        attempts = 1 + (settings.TELEMETRY_MAX_RETRIES if retry else 0)
+        reason: str | None = None
+        for attempt in range(attempts):
+            reason = self._post(payload)
+            if reason is None or reason not in _RETRYABLE:
+                return reason
+            if attempt + 1 < attempts:
+                time.sleep(settings.TELEMETRY_RETRY_BACKOFF * 2**attempt)
+        return reason
+
+    def _post(self, payload: dict) -> str | None:
+        """One attempt. ``None`` on success, else a failure reason."""
         headers = {"X-API-Key": settings.API_KEY} if settings.AUTH_ENABLED else {}
         try:
             response = self._client.post(
@@ -635,21 +730,35 @@ class InferenceWorker:
                         "steady-state rate of NUM_NODES per CHUNK_DURATION.",
                         self._throttled,
                     )
-                return False
+                return "throttled"
             if response.status_code >= 400:
                 PIPELINE_ERRORS.labels(stage="submit").inc()
                 log.warning(
                     "Telemetry API returned %s for node %s: %s",
                     response.status_code,
-                    payload["node_id"],
+                    payload.get("node_id"),
                     response.text[:200],
                 )
-                return False
-            return True
+                return "server_error" if response.status_code >= 500 else "rejected"
+            return None
         except httpx.HTTPError:
             PIPELINE_ERRORS.labels(stage="submit").inc()
             log.warning("Could not reach telemetry API at %s", self.inference_url, exc_info=True)
-            return False
+            return "unreachable"
+
+    def _dead_letter(self, payload: dict, reason: str) -> None:
+        """Keep a payload the API did not accept, or count it as lost."""
+        node = str(payload["node_id"])
+        if self.dead_letter is None:
+            TELEMETRY_DROPPED.labels(node_id=node).inc()
+            return
+        try:
+            self.dead_letter(payload, reason)
+            TELEMETRY_DEAD_LETTERED.labels(reason=reason).inc()
+        except Exception:
+            TELEMETRY_DROPPED.labels(node_id=node).inc()
+            PIPELINE_ERRORS.labels(stage="dead_letter").inc()
+            log.warning("Could not dead-letter payload for node %s", node, exc_info=True)
 
     def handle_window(self, window: NodeWindow) -> list[dict]:
         """Buffer a window and, once the array is ready, infer and submit."""
@@ -676,9 +785,16 @@ class InferenceWorker:
         with track_stage("inference"):
             payloads = self.infer(x, timespans, snapshot)
 
+        # Once one payload has exhausted its retries against an API that is down,
+        # the rest of this snapshot goes straight to the dead-letter topic rather
+        # than paying the same retries again — an outage must not slow the
+        # consumer to a crawl. The next snapshot tries afresh.
+        api_down = False
         for payload in payloads:
-            if not self.submit(payload):
-                TELEMETRY_DROPPED.labels(node_id=str(payload["node_id"])).inc()
+            reason = self.deliver(payload, retry=not api_down)
+            if reason is not None:
+                api_down = api_down or reason in _RETRYABLE
+                self._dead_letter(payload, reason)
             self._raise_alert(payload)
         return payloads
 
@@ -700,7 +816,7 @@ class InferenceWorker:
             fault=diagnosis.get("fault", "Unrecognised acoustic anomaly"),
             confidence=float(diagnosis.get("confidence", 0.0)),
             anomaly_score=payload["anomaly_score"],
-            ttf_prediction=payload["ttf_prediction"],
+            degradation_score=payload["degradation_score"],
             evidence=tuple(diagnosis.get("evidence", ())),
             recommended_action=diagnosis.get("recommended_action", ""),
             location=tuple(payload["source_position"]) if payload.get("source_position") else None,
@@ -734,9 +850,69 @@ class _Shutdown:
         self.requested = True
 
 
+class _DeadLetterWriter:
+    """
+    Produces undelivered telemetry to the dead-letter topic.
+
+    The worker only commits a batch's offsets once :meth:`settle` confirms every
+    dead-letter write from that batch was acknowledged — otherwise a crash, or a
+    broker that refused the write, would lose exactly the payloads the topic
+    exists to keep.
+    """
+
+    def __init__(self, producer) -> None:
+        self._producer = producer
+        self._failed = 0
+
+    def _on_delivery(self, err, _msg) -> None:
+        if err is not None:
+            self._failed += 1
+            PIPELINE_ERRORS.labels(stage="dead_letter").inc()
+            log.error("Dead-letter write failed: %s", err)
+
+    def __call__(self, payload: dict, reason: str) -> None:
+        record = {
+            "reason": reason,
+            "array_id": settings.ARRAY_ID,
+            "dead_lettered_at": time.time(),
+            "payload": payload,
+        }
+        self._producer.produce(
+            settings.TELEMETRY_DLQ_TOPIC,
+            key=str(payload["node_id"]).encode("utf-8"),
+            value=json.dumps(record).encode("utf-8"),
+            on_delivery=self._on_delivery,
+        )
+        self._producer.poll(0)
+
+    def settle(self, timeout: float = DEAD_LETTER_FLUSH_TIMEOUT_SECONDS) -> bool:
+        """Block until queued writes resolve. True only if all were acknowledged."""
+        remaining = self._producer.flush(timeout)
+        ok = remaining == 0 and self._failed == 0
+        self._failed = 0
+        return ok
+
+
+def _rewind(consumer, first_offsets: dict[tuple[str, int], int]) -> None:
+    """
+    Seek back to the start of a batch so it is consumed again.
+
+    Merely skipping a commit does not redeliver anything: the consumer's
+    position has already moved past the batch, and the *next* successful commit
+    acknowledges it along with everything after.
+    """
+    from confluent_kafka import TopicPartition
+
+    for (topic, partition), offset in first_offsets.items():
+        try:
+            consumer.seek(TopicPartition(topic, partition, offset))
+        except Exception:
+            log.warning("Could not rewind %s[%d] to %d", topic, partition, offset, exc_info=True)
+
+
 def run_worker(max_batches: int | None = None) -> int:
     """Consume windowed spectrograms and emit telemetry. Returns snapshots processed."""
-    from confluent_kafka import Consumer, KafkaError
+    from confluent_kafka import Consumer, KafkaError, Producer
 
     consumer = Consumer(
         {
@@ -746,14 +922,28 @@ def run_worker(max_batches: int | None = None) -> int:
             "enable.auto.commit": False,
             "session.timeout.ms": 30_000,
             "max.poll.interval.ms": 300_000,
+            # The control topic is written only when an operator re-baselines,
+            # which may be never. Without this the subscription reports an
+            # unknown topic on every metadata refresh until someone does.
+            "allow.auto.create.topics": True,
         }
     )
-    topics = [settings.WINDOWED_TOPIC]
+    topics = [settings.WINDOWED_TOPIC, settings.CONTROL_TOPIC]
     if settings.TDOA_ENABLED:
         topics.append(settings.SPATIAL_TOPIC)
     consumer.subscribe(topics)
 
-    worker = InferenceWorker()
+    dead_letter = _DeadLetterWriter(
+        Producer(
+            {
+                "bootstrap.servers": settings.KAFKA_BROKER,
+                "enable.idempotence": True,
+                "acks": "all",
+                "compression.type": settings.KAFKA_COMPRESSION,
+            }
+        )
+    )
+    worker = InferenceWorker(dead_letter=dead_letter)
     shutdown = _Shutdown() if max_batches is None else None
 
     snapshots = 0
@@ -780,17 +970,29 @@ def run_worker(max_batches: int | None = None) -> int:
             if not messages:
                 continue
 
+            first_offsets: dict[tuple[str, int], int] = {}
             for msg in messages:
                 if msg.error():
                     if msg.error().code() != KafkaError._PARTITION_EOF:
                         log.warning("Consumer error: %s", msg.error())
+                    continue
+                first_offsets.setdefault((msg.topic(), msg.partition()), msg.offset())
+
+                if msg.topic() == settings.CONTROL_TOPIC:
+                    try:
+                        worker.apply_control(json.loads(msg.value()))
+                    except Exception:
+                        PIPELINE_ERRORS.labels(stage="control").inc()
+                        log.warning("Could not apply control command", exc_info=True)
                     continue
 
                 if msg.topic() == settings.SPATIAL_TOPIC:
                     # Enrichment only: a bad spatial frame must never stop
                     # telemetry, so the graph simply keeps its previous weights.
                     try:
-                        worker.apply_spatial(msgpack.unpackb(msg.value(), raw=False))
+                        spatial = msgpack.unpackb(msg.value(), raw=False)
+                        if spatial.get("array_id", worker.array_id) == worker.array_id:
+                            worker.apply_spatial(spatial)
                     except Exception:
                         PIPELINE_ERRORS.labels(stage="spatial_apply").inc()
                         log.warning("Could not apply spatial snapshot", exc_info=True)
@@ -799,12 +1001,29 @@ def run_worker(max_batches: int | None = None) -> int:
                 window = decode_window(msg.value())
                 if window is None:
                     continue
+                if window.array_id != worker.array_id:
+                    # Another array's window on our topic. Mixing it in would
+                    # corrupt the snapshot; it belongs to that array's worker.
+                    PIPELINE_ERRORS.labels(stage="foreign_array").inc()
+                    continue
                 try:
                     if worker.handle_window(window):
                         snapshots += 1
                 except Exception:
                     PIPELINE_ERRORS.labels(stage="worker").inc()
                     log.exception("Failed to process window from node %s", window.node_id)
+
+            if not dead_letter.settle():
+                # A dead-letter write was not acknowledged. Committing would
+                # acknowledge a payload that now exists nowhere, so the batch is
+                # consumed again instead; the API may see duplicates, which is
+                # the at-least-once trade.
+                log.warning(
+                    "Dead-letter writes unconfirmed — rewinding %d partition(s) for redelivery",
+                    len(first_offsets),
+                )
+                _rewind(consumer, first_offsets)
+                continue
 
             try:
                 consumer.commit(asynchronous=True)
@@ -819,6 +1038,7 @@ def run_worker(max_batches: int | None = None) -> int:
     except KeyboardInterrupt:  # pragma: no cover
         log.info("Interrupted — stopping worker")
     finally:
+        dead_letter.settle()
         consumer.close()
         worker.close()
 

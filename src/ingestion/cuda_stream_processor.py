@@ -408,10 +408,16 @@ def _publish_spatial(producer: Producer, probe: SpatialProbe) -> None:
     if snapshot.localized:
         SOURCE_LOCALIZED.inc()
 
-    # Unkeyed: a spatial snapshot describes the whole array, not one node.
+    # Keyed by array: a spatial snapshot describes the whole array, and it must
+    # reach the same worker as that array's windows. Unkeyed, it was spread
+    # round-robin across partitions, so with more than one consumer each worker
+    # saw only some of its array's TDOA updates.
+    payload = snapshot.to_payload()
+    payload["array_id"] = settings.ARRAY_ID
     producer.produce(
         settings.SPATIAL_TOPIC,
-        value=msgpack.packb(snapshot.to_payload(), use_bin_type=True),
+        key=settings.ARRAY_ID.encode("utf-8"),
+        value=msgpack.packb(payload, use_bin_type=True),
         callback=_delivery_callback,
     )
 
@@ -427,8 +433,8 @@ def _publish(
     buffer.push(node_id, spec, timestamp)
     key = str(node_id).encode("utf-8")
 
-    # Keying by node keeps a node's frames on one partition, which is what lets
-    # the in-process window buffer stay coherent across a consumer group.
+    # The per-frame topic stays keyed by node: its consumers are external and
+    # per-microphone. The windowed topic below is keyed by array instead.
     #
     # The per-frame topic is opt-in. Nothing inside Murmur subscribes to it —
     # the inference worker consumes WINDOWED_TOPIC — so publishing it by default
@@ -454,12 +460,19 @@ def _publish(
 
     if buffer.is_ready(node_id):
         window, timespans = buffer.get_window(node_id)
+        # Keyed by *array*, not microphone. The worker assembles a snapshot from
+        # every microphone of an array, so all of them must land on the same
+        # partition. Keyed by node, a topic with several partitions spread one
+        # array across several workers, and none of them could complete a
+        # snapshot: each waited out ARRAY_MAX_WAIT and emitted a degraded one, or
+        # nothing at all when it held fewer than ARRAY_MIN_NODES microphones.
         producer.produce(
             settings.WINDOWED_TOPIC,
-            key=key,
+            key=settings.ARRAY_ID.encode("utf-8"),
             value=msgpack.packb(
                 {
                     "node_id": node_id,
+                    "array_id": settings.ARRAY_ID,
                     "timestamp": timestamp,
                     "window_shape": list(window.shape),
                     "window": window.astype(np.float32).tobytes(),

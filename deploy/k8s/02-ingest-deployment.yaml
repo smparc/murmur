@@ -7,6 +7,13 @@
 # the partition count of the raw topic, or replicas will idle while holding a
 # GPU; and a rebalance necessarily rebuilds the window (SEQ_LENGTH frames of
 # warmup) on whichever pod takes over.
+#
+# Keep this at one replica per array while TDOA_ENABLED is true. Source
+# localisation cross-correlates every microphone pair, so it needs the whole
+# array's raw audio in one process; two replicas would each see only the
+# microphones on their partitions and localise from half an array. The windows
+# this service publishes are keyed by ARRAY_ID, so the worker side is safe
+# regardless.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -16,6 +23,9 @@ data:
   KAFKA_BROKER: "murmur-kafka-broker:9092"
   RAW_TOPIC: "raw-audio-stream"
   PROCESSED_TOPIC: "spectrogram-embeddings"
+  # Kafka key for everything array-wide. One worker (and one ingest replica)
+  # per array; see 03-inference-deployment.yaml.
+  ARRAY_ID: "array-0"
   SAMPLE_RATE: "16000"
   N_MELS: "64"
   SEQ_LENGTH: "50"

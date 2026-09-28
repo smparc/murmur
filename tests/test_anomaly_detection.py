@@ -212,3 +212,102 @@ class TestAnomalyScorer:
         # Should complete without error and produce valid results
         assert isinstance(result.raw_score, float)
         assert isinstance(result.z_score, float)
+
+
+def _frame(level: float, generator: torch.Generator, jitter: float = 0.05) -> torch.Tensor:
+    """A frame whose energy score sits near ``level**2``, with frame-to-frame spread."""
+    scale = level * (1.0 + jitter * torch.randn(1, generator=generator).item())
+    return scale + 0.05 * torch.randn(64, 16, generator=generator)
+
+
+class TestPersistentFaults:
+    """
+    Regression for the reviewer's isolated check: 500 frames near a raw score of
+    1, then a sustained fault near 100, returned to "normal" at fault frame 251.
+    Flagged frames were admitted to the rolling baseline, so once they filled
+    half the window the median *was* the fault.
+    """
+
+    def _scorer(self, **kwargs) -> AnomalyScorer:
+        return AnomalyScorer(autoencoder=None, num_nodes=1, warmup_frames=50, window=500, **kwargs)
+
+    def test_a_sustained_fault_does_not_become_the_new_normal(self):
+        g = torch.Generator().manual_seed(0)
+        scorer = self._scorer()
+        for _ in range(500):
+            scorer.score(0, _frame(1.0, g))
+
+        flagged = [scorer.score(0, _frame(10.0, g)).is_anomaly for _ in range(1000)]
+        # Previously False from frame 251 onward.
+        assert all(flagged)
+
+    def test_a_slow_creep_is_caught_by_the_drift_guard(self):
+        """
+        Each step is far below the per-frame threshold, so the rolling baseline
+        follows the ramp. Only the anchor frozen at warmup can see how far it
+        has gone.
+        """
+
+        def run(drift_guard: bool) -> int:
+            g = torch.Generator().manual_seed(1)
+            scorer = self._scorer(drift_guard=drift_guard)
+            for _ in range(500):
+                scorer.score(0, _frame(1.0, g))
+            ramp = [scorer.score(0, _frame(1.0 + 0.0005 * i, g)) for i in range(4000)]
+            return sum(r.is_anomaly for r in ramp[-500:])
+
+        assert run(drift_guard=False) < 50  # absorbed: the ramp became the baseline
+        assert run(drift_guard=True) == 500
+
+    def test_a_transient_clears_once_the_machine_recovers(self):
+        g = torch.Generator().manual_seed(2)
+        scorer = self._scorer()
+        for _ in range(500):
+            scorer.score(0, _frame(1.0, g))
+        blip = [scorer.score(0, _frame(3.0, g)).is_anomaly for _ in range(10)]
+        after = [scorer.score(0, _frame(1.0, g)).is_anomaly for _ in range(200)]
+        assert all(blip)
+        assert sum(after) <= 5  # background false-alarm rate, not a stuck flag
+
+    def test_drift_flag_reports_a_non_zero_anomaly_score(self):
+        """A drift-only flag must not reach the API as an anomaly score of ~0."""
+        g = torch.Generator().manual_seed(3)
+        scorer = self._scorer()
+        for _ in range(500):
+            scorer.score(0, _frame(1.0, g))
+        for i in range(4000):
+            result = scorer.score(0, _frame(1.0 + 0.0005 * i, g))
+        assert result.is_anomaly
+        assert result.drift_z >= scorer.z_threshold
+        assert result.normalized_score > 0.3
+
+    def test_rebaseline_accepts_a_new_operating_point(self):
+        g = torch.Generator().manual_seed(4)
+        scorer = self._scorer()
+        for _ in range(500):
+            scorer.score(0, _frame(1.0, g))
+        for _ in range(100):
+            assert scorer.score(0, _frame(2.0, g)).is_anomaly
+
+        assert scorer.rebaseline(0) is True
+        after = [scorer.score(0, _frame(2.0, g)).is_anomaly for _ in range(300)]
+        assert sum(after) <= 5
+        # And it still detects a genuine fault above the new normal.
+        assert scorer.score(0, _frame(4.0, g)).is_anomaly
+
+    def test_rebaseline_without_history_restarts_warmup(self):
+        g = torch.Generator().manual_seed(5)
+        scorer = self._scorer()
+        for _ in range(10):
+            scorer.score(0, _frame(1.0, g))
+        assert scorer.rebaseline(0) is False
+        assert scorer.get_node_summary()[0]["total_frames"] == 0
+
+    def test_drift_guard_arms_at_end_of_warmup(self):
+        g = torch.Generator().manual_seed(6)
+        scorer = self._scorer()
+        for _ in range(49):
+            scorer.score(0, _frame(1.0, g))
+        assert scorer.get_node_summary()[0]["drift_guard_armed"] is False
+        scorer.score(0, _frame(1.0, g))
+        assert scorer.get_node_summary()[0]["drift_guard_armed"] is True

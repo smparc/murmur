@@ -29,7 +29,12 @@ from torch.utils.data import DataLoader, TensorDataset
 from benchmarks.baselines import lookup
 from benchmarks.datasets import AudioSample, load_dataset, split_normal_train
 from benchmarks.features import mel_transform, to_log_mel
-from benchmarks.metrics import average_precision, partial_roc_auc, roc_auc
+from benchmarks.metrics import (
+    average_precision,
+    partial_roc_auc,
+    roc_auc,
+    standardized_partial_roc_auc,
+)
 from src.detection.anomaly_detector import SpectrogramAutoencoder
 
 log = logging.getLogger(__name__)
@@ -126,6 +131,9 @@ def evaluate_group(
     return {
         "auc": roc_auc(scores, labels),
         "pauc_10": partial_roc_auc(scores, labels, max_fpr=0.1),
+        # The scale published DCASE baselines use. Only this one is compared
+        # against `baseline_pauc`; `pauc_10` is mean recall and reads ~0.28 lower.
+        "pauc_10_standardized": standardized_partial_roc_auc(scores, labels, max_fpr=0.1),
         "average_precision": average_precision(scores, labels),
         "train_samples": len(train_samples),
         "test_samples": len(test_samples),
@@ -168,8 +176,14 @@ def evaluate(
         if baseline is not None:
             scored.update(baseline.as_dict())
             scored["auc_vs_baseline"] = scored["auc"] - baseline.auc
+            scored["pauc_vs_baseline"] = scored["pauc_10_standardized"] - baseline.pauc
         results[group] = scored
-        log.info("  AUC %.4f | pAUC@10%% %.4f", scored["auc"], scored["pauc_10"])
+        log.info(
+            "  AUC %.4f | pAUC@10%% %.4f (standardised %.4f)",
+            scored["auc"],
+            scored["pauc_10"],
+            scored["pauc_10_standardized"],
+        )
 
     if not results:
         raise RuntimeError("No group could be scored; check the dataset layout")
@@ -180,6 +194,9 @@ def evaluate(
         "per_group": results,
         "mean_auc": float(np.mean([r["auc"] for r in results.values()])),
         "mean_pauc_10": float(np.mean([r["pauc_10"] for r in results.values()])),
+        "mean_pauc_10_standardized": float(
+            np.mean([r["pauc_10_standardized"] for r in results.values()])
+        ),
         "groups_scored": len(results),
         "epochs": epochs,
         "seed": seed,
@@ -192,26 +209,29 @@ def format_report(results: dict) -> str:
     lines = [
         f"### {results['dataset'].upper()} — {results['groups_scored']} machine units",
         "",
-        "| Machine | AUC | pAUC@10% | AP | Baseline AUC | Δ |",
-        "| :-- | --: | --: | --: | --: | --: |",
+        "| Machine | AUC | Baseline AUC | pAUC@10% (std) | Baseline pAUC | pAUC@10% (recall) | AP |",
+        "| :-- | --: | --: | --: | --: | --: | --: |",
     ]
+
+    def fmt(value: float | None) -> str:
+        return f"{value:.4f}" if value is not None else "—"
+
     for group, row in sorted(results["per_group"].items()):
-        baseline = row.get("baseline_auc")
-        delta = row.get("auc_vs_baseline")
         lines.append(
-            f"| {group} | {row['auc']:.4f} | {row['pauc_10']:.4f} | "
-            f"{row['average_precision']:.4f} | "
-            f"{f'{baseline:.4f}' if baseline is not None else '—'} | "
-            f"{f'{delta:+.4f}' if delta is not None else '—'} |"
+            f"| {group} | {row['auc']:.4f} | {fmt(row.get('baseline_auc'))} | "
+            f"{row['pauc_10_standardized']:.4f} | {fmt(row.get('baseline_pauc'))} | "
+            f"{row['pauc_10']:.4f} | {row['average_precision']:.4f} |"
         )
     lines += [
         "",
         f"**Mean AUC {results['mean_auc']:.4f} | "
-        f"Mean pAUC@10% {results['mean_pauc_10']:.4f}** "
+        f"Mean pAUC@10% {results['mean_pauc_10_standardized']:.4f} (standardised), "
+        f"{results['mean_pauc_10']:.4f} (mean recall)** "
         f"({results['epochs']} epochs, seed {results['seed']}, "
         f"{results['elapsed_s']}s)",
         "",
-        "Baseline column: DCASE 2020 Task 2 autoencoder baseline. See "
+        "Baseline columns: DCASE 2020 Task 2 autoencoder baseline. Its pAUC is "
+        "McClish-standardised, so compare it with the (std) column only. See "
         "`benchmarks/baselines.py` for the caveats before citing.",
     ]
     return "\n".join(lines)

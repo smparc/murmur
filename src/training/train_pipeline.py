@@ -7,9 +7,10 @@ Stages
    stage previously did not exist: the module imported ``SpectrogramAutoencoder``
    and never trained it, and the orchestration layer then looked for weights
    that were never written.
-2. **ST-GNN + Liquid Network** — jointly trained to forecast TTF from windowed
-   spectrograms, using the ST-GNN's *sequence* output so the continuous-time
-   model receives genuinely time-varying input.
+2. **ST-GNN + Liquid Network** — jointly trained to estimate a per-microphone
+   degradation score from windowed spectrograms, using the ST-GNN's per-node
+   *sequence* output so the continuous-time model receives genuinely
+   time-varying input, and so it is trained on the quantity the worker serves.
 3. **Projection adapter** — aligns acoustic embeddings with the LLM's token
    embedding space. Skipped, loudly, when no LLM is available locally.
 
@@ -47,7 +48,7 @@ from src.forecasting.conformal import (
     evaluate_coverage,
     severity_bucket,
 )
-from src.forecasting.liquid_network import AcousticForecastingLNN
+from src.forecasting.liquid_network import AcousticForecastingLNN, per_node_forecast
 from src.mapping.st_gnn_model import SpatioTemporalGNN
 from src.mapping.topology_graph import build_acoustic_topology
 from src.settings import settings
@@ -104,8 +105,16 @@ def generate_degradation_data(
     -------
     x:
         ``(N, seq_length, num_nodes * in_channels)``
-    y_ttf:
-        ``(N, 1)`` failure probability in ``[0, 1]``
+    y:
+        ``(N, num_nodes)`` degradation score per microphone, in ``[0, 1]``. The
+        microphone at the failing machine carries the fault's severity; every
+        other microphone carries a healthy draw from ``U(0, 0.1)``, because the
+        machine *it* monitors is healthy even though it hears the fault
+        attenuated. Telling those apart is the spatial model's job.
+
+        This is a severity, not a time-to-failure: nothing here has a time axis.
+        It was previously named ``ttf`` and served as "failure probability",
+        neither of which it is.
     timespans:
         ``(N, seq_length)`` inter-frame intervals in seconds
     """
@@ -131,7 +140,7 @@ def generate_degradation_data(
     distances = np.sqrt((deltas**2).sum(-1))
 
     x_all = np.empty((num_sequences, seq_length, num_nodes, in_channels), dtype=np.float32)
-    y_all = np.empty((num_sequences, 1), dtype=np.float32)
+    y_all = np.empty((num_sequences, num_nodes), dtype=np.float32)
     ts_all = np.empty((num_sequences, seq_length), dtype=np.float32)
 
     fault_names = list(_FAULT_PROFILES)
@@ -143,6 +152,7 @@ def generate_degradation_data(
         # model onto the spectral, spatial and temporal structure of the fault.
         floor = ambient_level * float(rng.uniform(0.6, 1.7))
         signal = rng.normal(0.0, floor, size=(seq_length, num_nodes, in_channels))
+        labels = rng.uniform(0.0, 0.1, size=num_nodes)
 
         if rng.random() < anomaly_ratio:
             # Degradation is continuous, and sampling it that way is not a
@@ -179,12 +189,10 @@ def generate_degradation_data(
 
             contribution = envelope[:, None, None] * gains[None, :, None] * profile[None, None, :]
             signal += 2.5 * contribution
-            ttf = severity
-        else:
-            ttf = float(rng.uniform(0.0, 0.1))
+            labels[source] = severity
 
         x_all[i] = signal.astype(np.float32)
-        y_all[i, 0] = ttf
+        y_all[i] = labels
         # 500 ms nominal cadence with edge-network jitter.
         ts_all[i] = np.clip(0.5 + rng.normal(0.0, 0.05, size=seq_length), 0.1, None).astype(
             np.float32
@@ -474,14 +482,23 @@ def _forward_forecast(
     edge_weight: torch.Tensor,
 ) -> torch.Tensor:
     """
-    ST-GNN sequence -> LNN forecast.
+    ST-GNN per-node sequence -> LNN, one degradation score per microphone.
 
-    ``return_sequence=True`` is the crux. Previously a single pooled embedding
-    was broadcast across the time axis with ``.expand()``, handing the
-    continuous-time network a constant and nullifying the reason to use one.
+    Returns ``(B, num_nodes)``. Two things are the crux:
+
+    - ``return_sequence=True``. Previously a single pooled embedding was
+      broadcast across the time axis with ``.expand()``, handing the
+      continuous-time network a constant and nullifying the reason to use one.
+    - **Per-node, via** :func:`per_node_forecast`. The worker serves one score
+      per microphone from that microphone's embedding trajectory. Training on
+      the pooled graph readout instead fitted the LNN — and the conformal radii
+      — to a quantity that is never served: pooled embeddings are a mean over
+      the array, per-node ones are not, and the model had never seen the latter.
     """
-    embedding_sequence = st_gnn(x, edge_index, edge_weight, return_sequence=True)
-    return lnn(embedding_sequence, timespans=ts)
+    _graph, node_sequence = st_gnn(
+        x, edge_index, edge_weight, return_sequence=True, return_nodes=True
+    )
+    return per_node_forecast(lnn, node_sequence, ts)
 
 
 def calibrate_forecaster(
@@ -511,6 +528,12 @@ def calibrate_forecaster(
 
     The test split is therefore halved: one half calibrates, the other measures
     coverage on data neither the model nor the calibrator has seen.
+
+    Calibration runs on per-node forecasts — the quantity the worker attaches
+    intervals to. The split is made by *sequence* before flattening to nodes, so
+    no acoustic instant contributes to both halves; nodes within one sequence
+    are correlated, which is why realised coverage is measured on the held-out
+    half rather than assumed.
     """
     alpha = settings.CONFORMAL_ALPHA if alpha is None else alpha
     log.info("Stage 4/4: conformal calibration (alpha=%.3f)", alpha)
@@ -522,18 +545,18 @@ def calibrate_forecaster(
     with torch.no_grad():
         preds = _forward_forecast(st_gnn, lnn, x_test, ts_test, edge_index, edge_weight)
 
-    predictions = preds.squeeze(-1).cpu().numpy()
-    targets = y_test.squeeze(-1).cpu().numpy()
+    predictions = preds.cpu().numpy()  # (sequences, nodes)
+    targets = y_test.cpu().numpy()
 
     half = len(predictions) // 2
     if half < 2:
         raise ValueError(
-            f"test split has {len(predictions)} samples — too few to both "
+            f"test split has {len(predictions)} sequences — too few to both "
             "calibrate and verify. Increase TRAIN_NUM_SAMPLES."
         )
 
-    cal_pred, cal_true = predictions[:half], targets[:half]
-    ver_pred, ver_true = predictions[half:], targets[half:]
+    cal_pred, cal_true = predictions[:half].ravel(), targets[:half].ravel()
+    ver_pred, ver_true = predictions[half:].ravel(), targets[half:].ravel()
 
     groups = np.array([severity_bucket(p) for p in cal_pred])
     calibrator = ConformalCalibrator(alpha=alpha).fit(cal_pred, cal_true, groups)
@@ -567,7 +590,7 @@ def train_forecaster(
     num_nodes: int,
     tracker: _Tracker | None = None,
 ) -> tuple[SpatioTemporalGNN, AcousticForecastingLNN, dict[str, float]]:
-    """Jointly train the spatial-temporal encoder and the TTF forecaster."""
+    """Jointly train the spatial-temporal encoder and the per-node degradation head."""
     log.info("Stage 2/3: training ST-GNN + Liquid Network")
 
     x_train, y_train, ts_train = (t.to(DEVICE) for t in splits["train"])
@@ -740,22 +763,33 @@ def train_projector(
 
     x_train, y_train, _ = (t.to(DEVICE) for t in splits["train"])
 
+    # Per-node, time-averaged — exactly the `gnn_embedding` the worker sends for
+    # each microphone. Training on the pooled graph embedding aligned the adapter
+    # to a vector the API never receives.
     with torch.no_grad():
-        embeddings = st_gnn(x_train, edge_index, edge_weight)
+        _graph, node_sequence = st_gnn(
+            x_train, edge_index, edge_weight, return_sequence=True, return_nodes=True
+        )
+        embeddings = node_sequence.mean(dim=1).reshape(-1, node_sequence.shape[-1])
 
     # Target: the LLM's mean token embedding for a description of the condition.
-    def describe(ttf: float) -> str:
-        if ttf >= 0.66:
-            return "critical acoustic anomaly, imminent mechanical failure"
-        if ttf >= 0.33:
+    def describe(degradation: float) -> str:
+        if degradation >= 0.66:
+            return "critical acoustic anomaly, severe mechanical degradation"
+        if degradation >= 0.33:
             return "elevated acoustic anomaly, progressive degradation"
         return "nominal acoustic signature, machine healthy"
 
     with torch.no_grad():
+        # Three distinct sentences, so embed each once rather than per sample.
+        cache: dict[str, torch.Tensor] = {}
         targets = []
-        for value in y_train.squeeze(-1).tolist():
-            ids = tokenizer(describe(value), return_tensors="pt").input_ids.to(DEVICE)
-            targets.append(llm.get_input_embeddings()(ids).mean(dim=1).squeeze(0))
+        for value in y_train.reshape(-1).tolist():
+            text = describe(value)
+            if text not in cache:
+                ids = tokenizer(text, return_tensors="pt").input_ids.to(DEVICE)
+                cache[text] = llm.get_input_embeddings()(ids).mean(dim=1).squeeze(0)
+            targets.append(cache[text])
         target_tensor = torch.stack(targets)
 
     optimizer = optim.AdamW(projector.parameters(), lr=1e-4, weight_decay=1e-5)

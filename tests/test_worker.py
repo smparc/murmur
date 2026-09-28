@@ -289,7 +289,7 @@ class TestInferenceWorker:
         for payload in payloads:
             assert len(payload["gnn_embedding"]) == settings.GNN_EMBEDDING_DIM
             assert 0.0 <= payload["anomaly_score"] <= 1.0
-            assert 0.0 <= payload["ttf_prediction"] <= 1.0
+            assert 0.0 <= payload["degradation_score"] <= 1.0
             assert payload["anomaly_severity"] in {"normal", "warning", "critical"}
 
     def test_detection_happens_in_the_worker(self, worker):
@@ -348,7 +348,7 @@ class TestInferenceWorker:
         embeddings = {tuple(p["gnn_embedding"]) for p in payloads}
         assert len(embeddings) == settings.NUM_NODES, "every node must get its own embedding"
 
-        forecasts = {p["ttf_prediction"] for p in payloads}
+        forecasts = {p["degradation_score"] for p in payloads}
         assert len(forecasts) > 1, "forecasts must not be one pooled number copied N times"
 
     def test_degraded_array_still_emits_telemetry(self, worker):
@@ -467,7 +467,7 @@ class TestInferenceWorker:
             "timestamp": 1000.0,
             "anomaly_score": 0.9,
             "anomaly_severity": severity,
-            "ttf_prediction": 0.4,
+            "degradation_score": 0.4,
             "is_anomaly": severity != "normal",
             "z_score": 6.0,
         }
@@ -566,3 +566,206 @@ class TestInferenceWorker:
             assert w.submit({"node_id": 0}) is False
         finally:
             w.close()
+
+
+def _scripted_worker(statuses: list[int], override_settings, dead_letter=None):
+    """A worker whose API answers with ``statuses`` in turn (the last one repeats)."""
+    import httpx
+
+    override_settings(SEQ_LENGTH=8, TELEMETRY_RETRY_BACKOFF=0.0, TELEMETRY_MAX_RETRIES=2)
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = statuses[min(len(calls), len(statuses) - 1)]
+        calls.append(status)
+        return httpx.Response(status, json={})
+
+    w = InferenceWorker(
+        inference_url="http://testserver",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        load_weights=False,
+        dead_letter=dead_letter,
+    )
+    w.assembler = WindowAssembler(
+        num_nodes=settings.NUM_NODES, seq_length=8, n_mels=settings.N_MELS
+    )
+    return w, calls
+
+
+def _emit_snapshot(worker: InferenceWorker) -> list[dict]:
+    now = time.time()
+    payloads: list[dict] = []
+    for node in range(settings.NUM_NODES):
+        payloads = worker.handle_window(_window(node, now)) or payloads
+    return payloads
+
+
+class TestTelemetryDelivery:
+    """
+    Failed submissions used to be counted as dropped while the loop committed
+    offsets regardless, so a scored result the API never accepted existed
+    nowhere. They are now retried when the failure is transient and otherwise
+    kept on a dead-letter topic with the reason.
+    """
+
+    def test_transient_failure_is_retried_then_succeeds(self, override_settings):
+        w, calls = _scripted_worker([503, 503, 200], override_settings)
+        assert w.deliver({"node_id": 0}) is None
+        assert calls == [503, 503, 200]
+
+    def test_exhausted_retries_report_the_reason(self, override_settings):
+        w, calls = _scripted_worker([503], override_settings)
+        assert w.deliver({"node_id": 0}) == "server_error"
+        assert len(calls) == 1 + settings.TELEMETRY_MAX_RETRIES
+
+    def test_rejected_payload_is_not_retried(self, override_settings):
+        """A 4xx will be rejected however many times it is sent."""
+        w, calls = _scripted_worker([422], override_settings)
+        assert w.deliver({"node_id": 0}) == "rejected"
+        assert len(calls) == 1
+
+    def test_throttling_is_not_retried(self, override_settings):
+        """The limiter window is 60 s; a sub-second retry cannot outwait it."""
+        w, calls = _scripted_worker([429], override_settings)
+        assert w.deliver({"node_id": 0}) == "throttled"
+        assert len(calls) == 1
+
+    def test_undelivered_payloads_are_dead_lettered(self, override_settings):
+        kept: list[tuple[dict, str]] = []
+        w, _ = _scripted_worker(
+            [500], override_settings, dead_letter=lambda p, r: kept.append((p, r))
+        )
+        payloads = _emit_snapshot(w)
+        assert len(kept) == len(payloads) == settings.NUM_NODES
+        assert {reason for _, reason in kept} == {"server_error"}
+        assert [p["node_id"] for p, _ in kept] == [p["node_id"] for p in payloads]
+
+    def test_an_outage_does_not_retry_every_payload(self, override_settings):
+        """After one payload exhausts its retries, the rest of the snapshot skips them."""
+        w, calls = _scripted_worker([500], override_settings, dead_letter=lambda p, r: None)
+        _emit_snapshot(w)
+        assert len(calls) == (1 + settings.TELEMETRY_MAX_RETRIES) + (settings.NUM_NODES - 1)
+
+    def test_delivered_payloads_are_not_dead_lettered(self, override_settings):
+        kept: list = []
+        w, _ = _scripted_worker([200], override_settings, dead_letter=lambda p, r: kept.append(p))
+        assert len(_emit_snapshot(w)) == settings.NUM_NODES
+        assert kept == []
+
+    def test_a_failing_dead_letter_sink_does_not_stop_scoring(self, override_settings):
+        def broken(_payload, _reason):
+            raise RuntimeError("broker down")
+
+        w, _ = _scripted_worker([500], override_settings, dead_letter=broken)
+        assert len(_emit_snapshot(w)) == settings.NUM_NODES
+
+
+class TestDeadLetterWriter:
+    class _Producer:
+        def __init__(self, fail: bool = False, remaining: int = 0):
+            self.fail, self.remaining, self.sent, self._pending = fail, remaining, [], []
+
+        def produce(self, topic, key=None, value=None, on_delivery=None):
+            self.sent.append((topic, key, value))
+            self._pending.append(on_delivery)
+
+        def poll(self, _timeout):
+            return 0
+
+        def flush(self, _timeout):
+            for cb in self._pending:
+                cb("delivery failed" if self.fail else None, None)
+            self._pending.clear()
+            return self.remaining
+
+    def test_record_carries_payload_and_reason(self):
+        import json
+
+        from src.inference.worker import _DeadLetterWriter
+
+        producer = self._Producer()
+        writer = _DeadLetterWriter(producer)
+        writer({"node_id": 2, "anomaly_score": 0.9}, "unreachable")
+        assert writer.settle() is True
+
+        topic, key, value = producer.sent[0]
+        record = json.loads(value)
+        assert topic == settings.TELEMETRY_DLQ_TOPIC
+        assert key == b"2"
+        assert record["reason"] == "unreachable"
+        assert record["payload"]["anomaly_score"] == 0.9
+
+    def test_unacknowledged_writes_do_not_settle(self):
+        """The worker must not commit offsets for payloads that exist nowhere."""
+        from src.inference.worker import _DeadLetterWriter
+
+        failing = _DeadLetterWriter(self._Producer(fail=True))
+        failing({"node_id": 0}, "server_error")
+        assert failing.settle() is False
+
+        stuck = _DeadLetterWriter(self._Producer(remaining=1))
+        stuck({"node_id": 0}, "server_error")
+        assert stuck.settle() is False
+
+
+class TestControlCommands:
+    def _warmed(self, worker: InferenceWorker, node: int = 0) -> None:
+        g = torch.Generator().manual_seed(0)
+        for _ in range(settings.ANOMALY_WARMUP_FRAMES + 10):
+            worker.scorer.score(node, torch.rand(settings.N_MELS, 6, generator=g))
+
+    def test_rebaseline_reaches_the_scorer(self, worker):
+        self._warmed(worker)
+        assert worker.apply_control(
+            {"command": "rebaseline", "array_id": settings.ARRAY_ID, "node_id": 0, "reason": "x"}
+        )
+        assert worker.scorer.get_node_summary()[0]["drift_guard_armed"]
+
+    def test_a_command_for_another_array_is_ignored(self, worker):
+        assert not worker.apply_control(
+            {"command": "rebaseline", "array_id": "some-other-array", "node_id": 0}
+        )
+
+    def test_unknown_commands_are_ignored(self, worker):
+        assert not worker.apply_control({"command": "format-disk"})
+
+    def test_cli_message_requires_a_reason(self):
+        from src.inference.control import build_rebaseline
+
+        with pytest.raises(ValueError, match="reason"):
+            build_rebaseline(0, "   ", "tester")
+        with pytest.raises(ValueError, match="outside this array"):
+            build_rebaseline(settings.NUM_NODES, "valid", "tester")
+        command = build_rebaseline(None, "line restarted", "tester")
+        assert command["command"] == "rebaseline"
+        assert command["node_id"] is None
+        assert command["array_id"] == settings.ARRAY_ID
+
+
+class TestArrayIdentity:
+    def _raw(self, **extra) -> bytes:
+        import msgpack
+
+        seq, mels, frames = 4, settings.N_MELS, 3
+        payload = {
+            "node_id": 1,
+            "timestamp": 5.0,
+            "window_shape": [seq, mels, frames],
+            "window": np.zeros((seq, mels, frames), dtype=np.float32).tobytes(),
+            "timespans": np.ones(seq, dtype=np.float32).tobytes(),
+            **extra,
+        }
+        return msgpack.packb(payload, use_bin_type=True)
+
+    def test_window_reports_its_array(self):
+        assert decode_window(self._raw(array_id="hall-3")).array_id == "hall-3"
+
+    def test_legacy_window_is_attributed_to_this_array(self):
+        """Windows produced before array keying can only be from this deployment."""
+        assert decode_window(self._raw()).array_id == settings.ARRAY_ID
+
+
+class TestPayloadCarriesDrift:
+    def test_drift_z_is_reported(self, worker):
+        for payload in _emit_snapshot(worker):
+            assert "drift_z" in payload

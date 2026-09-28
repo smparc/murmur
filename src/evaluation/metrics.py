@@ -11,6 +11,23 @@ entire false-positive range, including the region where the detector fires on
 detector can post a respectable AUC while being useless in the only regime it
 would actually be deployed in. DCASE's anomalous-sound task reports pAUC at
 ``p = 0.1`` for exactly this reason, and so does this module.
+
+Two pAUC scales, and they are not interchangeable
+-------------------------------------------------
+Both are affine maps of the same raw partial area ``A`` under the ROC curve
+over ``fpr in [0, p]``:
+
+- :func:`partial_auc` returns ``A / p`` â€” mean recall over the strip. Chance is
+  ``p / 2``; a detector blind at low FPR scores 0.
+- :func:`standardized_partial_auc` returns the McClish standardisation, which
+  is what ``sklearn.metrics.roc_auc_score(max_fpr=p)`` computes and therefore
+  what the official DCASE 2020 evaluator and every published DCASE baseline
+  report. Chance is 0.5.
+
+Because both are affine in ``A`` the conversion is exact
+(:func:`to_standardized_pauc`), but the numbers are on different scales: the
+same detector reads 0.41 on one and 0.69 on the other. **Compare against a
+published DCASE pAUC only on the standardised scale.**
 """
 
 from __future__ import annotations
@@ -122,6 +139,33 @@ def partial_auc(scores: np.ndarray, labels: np.ndarray, max_fpr: float = 0.1) ->
     return float(np.trapezoid(tpr_c, fpr_c) / max_fpr)
 
 
+def to_standardized_pauc(pauc: float, max_fpr: float = 0.1) -> float:
+    """
+    Convert a :func:`partial_auc` value to the McClish scale.
+
+    With raw area ``A = pauc * max_fpr``, the standardisation is
+    ``0.5 * (1 + (A - A_min) / (A_max - A_min))`` where ``A_min = max_fpr**2 / 2``
+    is the chance diagonal and ``A_max = max_fpr`` a perfect detector. Exact,
+    so previously saved results can be converted without re-running anything.
+    """
+    if not 0.0 < max_fpr <= 1.0:
+        raise ValueError(f"max_fpr must be in (0, 1], got {max_fpr}")
+    area = pauc * max_fpr
+    min_area = 0.5 * max_fpr**2
+    return float(0.5 * (1.0 + (area - min_area) / (max_fpr - min_area)))
+
+
+def standardized_partial_auc(scores: np.ndarray, labels: np.ndarray, max_fpr: float = 0.1) -> float:
+    """
+    McClish-standardised partial AUC â€” the DCASE / scikit-learn convention.
+
+    Identical to ``sklearn.metrics.roc_auc_score(labels, scores, max_fpr=max_fpr)``.
+    Use this, not :func:`partial_auc`, for any comparison with a published DCASE
+    baseline; see the module docstring. At ``max_fpr = 1`` it reduces to full AUC.
+    """
+    return to_standardized_pauc(partial_auc(scores, labels, max_fpr), max_fpr)
+
+
 def detection_report(
     scores: np.ndarray, labels: np.ndarray, max_fpr: float = 0.1
 ) -> dict[str, float]:
@@ -129,9 +173,12 @@ def detection_report(
     scores = np.asarray(scores, dtype=np.float64).ravel()
     labels = np.asarray(labels).ravel().astype(int)
 
+    pauc = partial_auc(scores, labels, max_fpr)
     return {
         "auc": roc_auc(scores, labels),
-        "pauc": partial_auc(scores, labels, max_fpr),
+        "pauc": pauc,
+        # The scale published DCASE baselines are reported on.
+        "pauc_standardized": to_standardized_pauc(pauc, max_fpr),
         "max_fpr": max_fpr,
         "n_normal": int((labels == 0).sum()),
         "n_anomalous": int((labels == 1).sum()),

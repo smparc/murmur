@@ -169,7 +169,7 @@ def anomaly_detector_health() -> MaterializeResult:
     description="Evaluates the saved forecaster for drift against a baseline.",
 )
 def liquid_network_drift_check() -> MaterializeResult:
-    from src.forecasting.liquid_network import AcousticForecastingLNN
+    from src.forecasting.liquid_network import AcousticForecastingLNN, per_node_forecast
     from src.mapping.st_gnn_model import SpatioTemporalGNN
     from src.mapping.topology_graph import build_acoustic_topology
     from src.training.train_pipeline import compute_metrics, generate_degradation_data
@@ -217,8 +217,12 @@ def liquid_network_drift_check() -> MaterializeResult:
     st_gnn.eval()
     lnn.eval()
     with torch.no_grad():
-        sequence = st_gnn(x_eval, edge_index, edge_weight, return_sequence=True)
-        preds = lnn(sequence, timespans=ts_eval)
+        # The served path: one score per microphone. The pooled graph readout
+        # is not what the worker ships, so drift on it would measure nothing.
+        _graph, node_sequence = st_gnn(
+            x_eval, edge_index, edge_weight, return_sequence=True, return_nodes=True
+        )
+        preds = per_node_forecast(lnn, node_sequence, ts_eval)
         metrics = compute_metrics(preds, y_eval)
         baseline = compute_metrics(torch.full_like(y_eval, float(y_eval.mean())), y_eval)
 
